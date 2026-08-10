@@ -1,6 +1,6 @@
 # PRPLL Docker for CUDA
 
-使用 Docker 一键部署 [PRPLL](https://github.com/tdulcet/PRPLL)（GPU 梅森素数 PRP/证明测试）和 [AutoPrimeNet](https://github.com/tdulcet/AutoPrimeNet)（PrimeNet 任务自动领取与结果上报）
+使用 Docker 一键部署 [PRPLL](https://github.com/preda/gpuowl)（GPU 梅森素数 PRP/证明测试）和 [AutoPrimeNet](https://github.com/tdulcet/AutoPrimeNet)（PrimeNet 任务自动领取与结果上报）
 
 仅支持 CUDA！
 

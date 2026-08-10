@@ -1,0 +1,38 @@
+x-proxy-args: &proxy-args
+  HTTP_PROXY: http://192.168.1.5:7897
+  HTTPS_PROXY: http://192.168.1.5:7897
+  NO_PROXY: localhost,127.0.0.1
+
+services:
+  prpll:
+    build:
+      context: ./PRPLL/
+      # 如需代理请取消注释
+      # args: *proxy-args
+    network_mode: none
+    restart: unless-stopped
+    # NVIDIA GPU
+    # 需安装 nvidia-container-toolkit
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      - ./data:/opt/prpll/data
+      - /etc/localtime:/etc/localtime:ro
+    command: ["-dir", "/opt/prpll/data/"]
+
+  autoprimenet:
+    build:
+      context: ./AutoPrimeNet/
+      # 同上
+      # args: *proxy-args
+    restart: unless-stopped
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      - ./data:/opt/autoprimenet/data
+    command: ["--prpll", "-w", "/opt/autoprimenet/data/", "-l", "prime.ini", "--watch", "--cert-work"]

@@ -1,18 +1,8 @@
-x-proxy-args: &proxy-args
-  HTTP_PROXY: http://192.168.1.5:7897
-  HTTPS_PROXY: http://192.168.1.5:7897
-  NO_PROXY: localhost,127.0.0.1
-
 services:
   prpll:
-    build:
-      context: ./PRPLL/
-      # 如需代理请取消注释
-      # args: *proxy-args
+    image: ghcr.io/yanshiqwq/prpll_docker/prpll:latest
     network_mode: none
     restart: unless-stopped
-    # NVIDIA GPU
-    # 需安装 nvidia-container-toolkit
     deploy:
       resources:
         reservations:
@@ -26,10 +16,7 @@ services:
     command: ["-dir", "/opt/prpll/data/"]
 
   autoprimenet:
-    build:
-      context: ./AutoPrimeNet/
-      # 同上
-      # args: *proxy-args
+    image: ghcr.io/yanshiqwq/prpll_docker/autoprimenet:latest
     restart: unless-stopped
     environment:
       - TZ=Asia/Shanghai

@@ -1,6 +1,1 @@
-data/*.log
-data/core.*
-data/prime.ini
-data/worktodo-*.txt
-data/results-*.txt
-data/results_sent-*.txt
+data/

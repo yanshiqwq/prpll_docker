@@ -23,3 +23,20 @@ services:
     volumes:
       - ./data:/opt/autoprimenet/data
     command: ["--prpll", "-w", "/opt/autoprimenet/data/", "-l", "prime.ini", "--watch", "--cert-work"]
+
+  monitor:
+    build: ./monitor
+    image: ghcr.io/yanshiqwq/prpll_docker/monitor:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      - TZ=Asia/Shanghai
+      - DATA_DIR=/data
+      - PORT=8080
+      # 留空则自动按 compose label 查找 prpll 容器
+      - PRPLL_CONTAINER=
+    volumes:
+      - ./data:/data
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /etc/localtime:/etc/localtime:ro

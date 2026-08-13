@@ -1,0 +1,13 @@
+{
+  "name": "gimps-monitor",
+  "version": "1.0.0",
+  "private": true,
+  "description": "PRPLL / AutoPrimeNet 实时监控面板（零依赖 Node.js）",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

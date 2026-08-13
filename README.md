@@ -1,26 +1,26 @@
-# PRPLL Docker for CUDA
+# PRPLL Docker
 
 使用 Docker 一键部署 [PRPLL](https://github.com/preda/gpuowl)（GPU 梅森素数 PRP/证明测试）和 [AutoPrimeNet](https://github.com/tdulcet/AutoPrimeNet)（PrimeNet 任务自动领取与结果上报）
 
-仅支持 CUDA！
+（目前）仅支持 CUDA！
 
 ## 目录结构
 
 ```
 .
-├── .github/workflows/     # CI/CD：构建并推送镜像到 GHCR
+├── .github/workflows/     # CI/CD
 ├── AutoPrimeNet/          # AutoPrimeNet 镜像构建
 ├── PRPLL/                 # PRPLL 镜像构建
+├── monitor/               # 监控面板
 ├── data/                  # 数据目录（首次启动后自动生成）
-├── docker-compose.yml     # 服务编排
-└── start.sh               # 一键启动脚本
+└── docker-compose.yml     # 服务编排
 ```
 
 ## 环境要求
 
 - NVIDIA GPU
 - Docker 及 [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
-- Linux 主机（Windows 请使用 WSL2 配合 Docker Desktop，实测能跑）
+- Linux 主机（Windows 请使用 WSL2，实测能跑）
 
 ## 快速开始
 
@@ -53,8 +53,9 @@ docker compose logs -f
 | --- | --- | --- |
 | `prpll` | GPU 端执行 PRP 测试，数据目录为 `./data` | 无需网络 |
 | `autoprimenet` | 从 PrimeNet 领取任务、监测 PRPLL 进度并上报结果 | 正常网络 |
+| `monitor` | 实时监控面板 + 任务队列管理（暂停/恢复/取消/添加/导入） | 正常网络 |
 
-两个服务共享同一个 `data/` 目录：AutoPrimeNet 负责写入 `worktodo.txt` 并从 `results.txt` 读取结果，PRPLL 负责实际计算
+前两个服务共享同一个 `data/` 目录：AutoPrimeNet 负责写入 `worktodo.txt` 并从 `results.txt` 读取结果，PRPLL 负责实际计算
 
 ## 数据目录
 
@@ -72,6 +73,4 @@ docker compose logs -f
 - [AutoPrimeNet](https://github.com/tdulcet/AutoPrimeNet) — PrimeNet 自动化工具
 - [PrimeNet](https://www.mersenne.org/) — GIMPS 任务分配服务器
 
-项目 by [人](https://space.bilibili.com/431304449)
-
-README by [DeepSeek](https://chat.deepseek.com) + [人](https://space.bilibili.com/431304449)
+项目 + README by [DeepSeek](https://chat.deepseek.com) + [人](https://space.bilibili.com/431304449)

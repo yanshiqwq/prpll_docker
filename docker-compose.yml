@@ -11,9 +11,15 @@ services:
               count: all
               capabilities: [gpu]
     volumes:
-      - ./data:/opt/prpll/data
+      - gimps-data:/opt/prpll/data
       - /etc/localtime:/etc/localtime:ro
     command: ["-dir", "/opt/prpll/data/"]
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /opt/prpll/data/gpuowl-0.log && [ $$(( $$(date +%s) - $$(stat -c %Y /opt/prpll/data/gpuowl-0.log) )) -lt 600 ] || exit 1"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
 
   autoprimenet:
     image: ghcr.io/yanshiqwq/prpll_docker/autoprimenet:latest
@@ -21,22 +27,38 @@ services:
     environment:
       - TZ=Asia/Shanghai
     volumes:
-      - ./data:/opt/autoprimenet/data
+      - gimps-data:/opt/autoprimenet/data
     command: ["--prpll", "-w", "/opt/autoprimenet/data/", "-l", "prime.ini", "--watch", "--cert-work"]
+    healthcheck:
+      test: ["CMD-SHELL", "[ -e /opt/autoprimenet/data/autoprimenet.log ] && [ $$(( $$(date +%s) - $$(stat -c %Y /opt/autoprimenet/data/autoprimenet.log) )) -lt 7200 ] && kill -0 1 || exit 1"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
 
   monitor:
     build: ./monitor
     image: ghcr.io/yanshiqwq/prpll_docker/monitor:latest
     restart: unless-stopped
+    user: root
     ports:
-      - "127.0.0.1:8080:8080"
+      - "8086:8080"
     environment:
       - TZ=Asia/Shanghai
       - DATA_DIR=/data
-      - PORT=8080
       # 留空则自动按 compose label 查找 prpll 容器
       - PRPLL_CONTAINER=
     volumes:
-      - ./data:/data
+      - gimps-data:/data
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - /etc/localtime:/etc/localtime:ro
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:'+(process.env.PORT||8080)+'/api/status').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+volumes:
+  gimps-data:
+    external: true

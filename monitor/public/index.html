@@ -13,15 +13,15 @@
 <body>
 
   <mdui-top-app-bar scroll-behavior="elevate" class="top-bar">
+    <mdui-button-icon id="drawerBtn" icon="menu" class="drawer-btn" title="打开导航"></mdui-button-icon>
     <mdui-button-icon id="menuBtn" icon="memory" class="brand-icon"></mdui-button-icon>
     <span class="app-title">GIMPS 监控中心</span>
     <span id="healthBadge" class="health-badge">连接中…</span>
     <span id="clock" class="clock" title="服务器时间"></span>
     <mdui-button-icon id="themeBtn" icon="dark_mode" title="切换主题"></mdui-button-icon>
-    <mdui-button-icon id="refreshBtn" icon="refresh" title="立即刷新"></mdui-button-icon>
   </mdui-top-app-bar>
 
-  <mdui-tabs id="mainTabs" value="overview" class="main-tabs">
+  <mdui-tabs id="mainTabs" value="overview" class="main-tabs" full-width>
     <mdui-tab value="overview" icon="space_dashboard">总览</mdui-tab>
     <mdui-tab value="prpll-log" icon="terminal">PRPLL 日志</mdui-tab>
     <mdui-tab value="apn-log" icon="cloud_sync">AutoPrimeNet 日志</mdui-tab>
@@ -63,6 +63,10 @@
               </div>
               <span id="apnStatus" class="badge">…</span>
             </div>
+            <div class="apn-workpref">
+              <mdui-select id="apnWorkPref" label="领取任务类型" class="apn-workpref-select"></mdui-select>
+              <mdui-button id="apnWorkPrefSave" variant="tonal" icon="save">保存</mdui-button>
+            </div>
             <div id="apnBody" class="kv-list">
               <div class="empty">正在获取数据…</div>
             </div>
@@ -77,8 +81,15 @@
                 <mdui-icon name="show_chart" class="card-icon"></mdui-icon>
                 <div>
                   <div class="card-title">测试进度</div>
-                  <div class="card-subtitle">当前指数进度百分比（采样）</div>
+                  <div class="card-subtitle truncate">当前指数进度百分比（可选时间范围）</div>
                 </div>
+              </div>
+              <div class="chip-group chart-range">
+                <span class="type-chip" data-range="1h">1小时</span>
+                <span class="type-chip" data-range="6h">6小时</span>
+                <span class="type-chip active" data-range="24h">24小时</span>
+                <span class="type-chip" data-range="7d">7天</span>
+                <span class="type-chip" data-range="all">全部</span>
               </div>
             </div>
             <canvas id="progressChart" class="chart" height="220"></canvas>
@@ -89,8 +100,15 @@
                 <mdui-icon name="speed" class="card-icon"></mdui-icon>
                 <div>
                   <div class="card-title">计算速度</div>
-                  <div class="card-subtitle">最近 24 小时迭代速率（迭代/秒）</div>
+                  <div class="card-subtitle truncate">迭代速率（迭代/秒，可选时间范围）</div>
                 </div>
+              </div>
+              <div class="chip-group chart-range">
+                <span class="type-chip" data-range="1h">1小时</span>
+                <span class="type-chip" data-range="6h">6小时</span>
+                <span class="type-chip active" data-range="24h">24小时</span>
+                <span class="type-chip" data-range="7d">7天</span>
+                <span class="type-chip" data-range="all">全部</span>
               </div>
             </div>
             <canvas id="speedChart" class="chart" height="220"></canvas>
@@ -131,8 +149,26 @@
           </mdui-card>
         </div>
 
+        <div class="grid">
+          <!-- 数据与磁盘 -->
+          <mdui-card variant="elevated" class="panel-card">
+            <div class="card-head">
+              <div class="card-title-row">
+                <mdui-icon name="storage" class="card-icon"></mdui-icon>
+                <div>
+                  <div class="card-title">数据与磁盘</div>
+                  <div class="card-subtitle" id="filesSummary"></div>
+                </div>
+              </div>
+            </div>
+            <div id="filesList" class="list-scroll">
+              <div class="empty">正在获取数据…</div>
+            </div>
+          </mdui-card>
+        </div>
+
         <footer class="page-foot">
-          数据目录 <code id="dataDir">…</code> · 由监控服务实时解析，每 5 秒自动刷新
+          数据目录：<code id="dataDir">…</code>
         </footer>
       </main>
     </mdui-tab-panel>
@@ -148,9 +184,19 @@
                 <mdui-icon slot="icon" name="filter_alt"></mdui-icon>
               </mdui-text-field>
             </div>
+            <div class="chip-group log-levels" id="prpllLevels">
+              <span class="type-chip active" data-level="ALL">全部</span>
+              <span class="type-chip" data-level="info">信息</span>
+              <span class="type-chip" data-level="progress">进度</span>
+              <span class="type-chip" data-level="ok">校验</span>
+              <span class="type-chip" data-level="result">结果</span>
+              <span class="type-chip" data-level="warn">警告</span>
+              <span class="type-chip" data-level="error">错误</span>
+            </div>
             <div class="log-toolbar-right">
               <span class="auto-label">自动滚动</span>
               <mdui-switch id="prpllAutoScroll" checked></mdui-switch>
+              <mdui-button id="prpllDlBtn" variant="text" icon="download">下载</mdui-button>
               <mdui-button id="prpllCopyBtn" variant="text" icon="content_copy">复制</mdui-button>
               <mdui-button id="prpllClearBtn" variant="text" icon="clear_all">清屏</mdui-button>
             </div>
@@ -173,9 +219,18 @@
                 <mdui-icon slot="icon" name="filter_alt"></mdui-icon>
               </mdui-text-field>
             </div>
+            <div class="chip-group log-levels" id="apnLevels">
+              <span class="type-chip active" data-level="ALL">全部</span>
+              <span class="type-chip" data-level="info">信息</span>
+              <span class="type-chip" data-level="ok">校验</span>
+              <span class="type-chip" data-level="result">结果</span>
+              <span class="type-chip" data-level="warn">警告</span>
+              <span class="type-chip" data-level="error">错误</span>
+            </div>
             <div class="log-toolbar-right">
               <span class="auto-label">自动滚动</span>
               <mdui-switch id="apnAutoScroll" checked></mdui-switch>
+              <mdui-button id="apnDlBtn" variant="text" icon="download">下载</mdui-button>
               <mdui-button id="apnCopyBtn" variant="text" icon="content_copy">复制</mdui-button>
               <mdui-button id="apnClearBtn" variant="text" icon="clear_all">清屏</mdui-button>
             </div>
@@ -258,9 +313,12 @@
                 <span class="type-chip active" data-type="ALL">全部</span>
                 <span class="type-chip" data-type="LL">LL</span>
                 <span class="type-chip" data-type="PRP">PRP</span>
+                <span class="type-chip" data-type="CERT">CERT</span>
               </div>
             </div>
             <div class="log-toolbar-right">
+              <span class="legend-local">■ 本机完成</span>
+              <mdui-button id="histExportBtn" variant="text" icon="download">导出 CSV</mdui-button>
               <span id="histCount" class="auto-label"></span>
             </div>
           </div>
@@ -274,6 +332,7 @@
                   <th>计算机</th>
                   <th>软件</th>
                   <th>完成日期</th>
+                  <th>总耗时</th>
                 </tr>
               </thead>
               <tbody id="histBody"></tbody>
@@ -290,7 +349,7 @@
           <div class="log-toolbar">
             <div class="log-toolbar-left">
               <mdui-button id="taskAddBtn" icon="add" variant="tonal">添加任务</mdui-button>
-              <mdui-button id="taskImportBtn" icon="download" variant="tonal">一键导入 PrimeNet 任务</mdui-button>
+              <mdui-button id="taskImportBtn" icon="download" variant="tonal">导入 PrimeNet 任务</mdui-button>
             </div>
             <div class="log-toolbar-right">
               <span id="taskCount" class="auto-label"></span>
@@ -319,7 +378,7 @@
 PRPDC=7FF2E25C21ACE56601BEA8C46C827C15,1,2,89168969,-1,76,0,3,1</pre>
       <mdui-text-field id="addTaskInput" label="worktodo 行" textarea rows="4"></mdui-text-field>
     </div>
-    <div slot="footer">
+    <div slot="action">
       <mdui-button variant="text" id="addTaskCancel">取消</mdui-button>
       <mdui-button id="addTaskConfirm">添加</mdui-button>
     </div>
@@ -338,7 +397,7 @@ PRPDC=7FF2E25C21ACE56601BEA8C46C827C15,1,2,89168969,-1,76,0,3,1</pre>
         <p class="dialog-hint">中断正在运行的计算：PRPLL 保存检查点后退出并自动重启，本次操作马上生效。</p>
       </div>
     </div>
-    <div slot="footer">
+    <div slot="action">
       <mdui-button variant="text" id="cancelTaskCancel">再想想</mdui-button>
       <mdui-button id="cancelTaskConfirm" variant="tonal">确认取消</mdui-button>
     </div>
@@ -353,7 +412,7 @@ PRPDC=7FF2E25C21ACE56601BEA8C46C827C15,1,2,89168969,-1,76,0,3,1</pre>
         <p class="dialog-hint">中断正在运行的计算：PRPLL 保存检查点后退出并自动重启，本次操作马上生效，进度可随时恢复。</p>
       </div>
     </div>
-    <div slot="footer">
+    <div slot="action">
       <mdui-button variant="text" id="pauseTaskCancel">取消</mdui-button>
       <mdui-button id="pauseTaskConfirm">确认暂停</mdui-button>
     </div>
@@ -366,13 +425,65 @@ PRPDC=7FF2E25C21ACE56601BEA8C46C827C15,1,2,89168969,-1,76,0,3,1</pre>
         即将<b>永久取消 PrimeNet 上的分配</b>：该任务会从服务器回收，且无法通过本面板恢复。
         已完成的进度与检查点仍保留在本地，但如需继续计算此指数，必须重新领取分配。
       </p>
+      <div id="confirm2Info"></div>
       <p class="dialog-hint">请再次确认是否继续？</p>
     </div>
-    <div slot="footer">
-      <mdui-button variant="text" id="confirm2Cancel">取消操作</mdui-button>
-      <mdui-button id="confirm2Ok" variant="tonal">我确认，继续取消</mdui-button>
+    <div slot="action">
+      <mdui-button variant="text" id="confirm2Cancel">返回</mdui-button>
+      <mdui-button id="confirm2Ok" variant="tonal">确认取消分配</mdui-button>
     </div>
   </mdui-dialog>
+
+  <!-- 导入 PrimeNet 任务对话框（多选） -->
+  <mdui-dialog id="importDialog" headline="导入 PrimeNet 任务">
+    <div class="dialog-body">
+      <p class="dialog-hint">以下是在 PrimeNet 上已分配、但本地队列中缺失的任务，勾选后导入：</p>
+      <div class="import-toolbar">
+        <mdui-checkbox id="importSelectAll" checked>全选</mdui-checkbox>
+        <mdui-button variant="text" id="importSelectInvert">反选</mdui-button>
+        <span id="importCount" class="auto-label"></span>
+      </div>
+      <div id="importList" class="list-scroll import-list">
+        <div class="empty">正在加载 PrimeNet 分配…</div>
+      </div>
+      <div id="importTip" class="stale-tip hidden"></div>
+    </div>
+    <div slot="action">
+      <mdui-button variant="text" id="importCancel">取消</mdui-button>
+      <mdui-button id="importConfirm">导入选中</mdui-button>
+    </div>
+  </mdui-dialog>
+
+  <!-- 梅森素数发现弹窗（全屏） -->
+  <div id="primeOverlay" class="prime-overlay hidden">
+    <div class="prime-inner">
+      <div class="prime-label">🚨 跨次元数学事件 🚨</div>
+      <div class="prime-exp" id="primeExp">M31</div>
+      <div class="prime-big">IS&nbsp;PRIME!!!</div>
+      <div class="prime-cn">检测到新梅森素数</div>
+      <div class="prime-fact" id="primeFact"></div>
+      <div class="prime-sub" id="primeSub"></div>
+      <div class="prime-note" id="primeNote"></div>
+      <button id="primeDismiss" class="prime-dismiss">点这里承认你是见证人</button>
+    </div>
+  </div>
+
+  <!-- 移动端侧滑导航（窄屏启用） -->
+  <div class="drawer-scrim" id="drawerScrim"></div>
+  <aside class="nav-drawer" id="navDrawer" aria-hidden="true">
+    <div class="nav-drawer-header">
+      <mdui-icon name="memory" class="brand-icon"></mdui-icon>
+      <span class="nav-drawer-title">GIMPS 监控中心</span>
+    </div>
+    <nav class="nav-drawer-list">
+      <button class="nav-item" data-tab="overview"><mdui-icon name="space_dashboard"></mdui-icon><span>总览</span></button>
+      <button class="nav-item" data-tab="prpll-log"><mdui-icon name="terminal"></mdui-icon><span>PRPLL 日志</span></button>
+      <button class="nav-item" data-tab="apn-log"><mdui-icon name="cloud_sync"></mdui-icon><span>AutoPrimeNet 日志</span></button>
+      <button class="nav-item" data-tab="account"><mdui-icon name="account_circle"></mdui-icon><span>PrimeNet 账户</span></button>
+      <button class="nav-item" data-tab="history"><mdui-icon name="history"></mdui-icon><span>历史任务</span></button>
+      <button class="nav-item" data-tab="tasks"><mdui-icon name="playlist_add"></mdui-icon><span>任务队列</span></button>
+    </nav>
+  </aside>
 
   <script src="app.js"></script>
 </body>

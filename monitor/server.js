@@ -249,9 +249,10 @@ function parseGpuowlLog(name) {
     }
     if (!ts) continue;
 
-    const deviceM = /device \d+, (.+)$/.exec(line);
+    // PRPLL 输出形如 "device 0, OpenCL CUDA 13.3, unique id ''"，去掉无意义的 unique id 尾巴
+    const deviceM = /device \d+, (.+?)(?:, unique id.*)?$/.exec(line);
     if (deviceM) {
-      device = deviceM[1];
+      device = deviceM[1].trim();
       continue;
     }
 
@@ -491,7 +492,14 @@ function parseApnInternal() {
     }
   }
 
-  out.assignments = [...assignments.values()].sort((a, b) => a.exponent - b.exponent);
+  // 过滤幽灵项：仅保留仍存在于工作文件（worktodo / certwork）的指数，
+  // 取消分配或已完成但残留在日志中的任务不再展示
+  const activeExps = new Set();
+  for (const q of parseWorktodoFiles()) activeExps.add(q.exponent);
+  for (const c of parseCertworkFiles()) activeExps.add(c.exponent);
+  out.assignments = [...assignments.values()]
+    .filter((a) => activeExps.has(a.exponent))
+    .sort((a, b) => a.exponent - b.exponent);
   // 队列总耗时：单 worker 顺序执行，取分配中最后完成的那个（max ETA）
   const queueEtas = out.assignments.map((a) => a.etaSec).filter((v) => v != null);
   if (queueEtas.length) {
@@ -568,6 +576,7 @@ function parseIni() {
     }
     return {
       username: kv.username || kv.user_name || null,
+      computerId: kv.ComputerID || null,
       cpuBrand: kv.CpuBrand || null,
       numCores: kv.NumCores ? +kv.NumCores : null,
       daysOfWork: kv.DaysOfWork ? parseFloat(kv.DaysOfWork) : null,
@@ -581,6 +590,25 @@ function parseIni() {
       workFile: kv.work_file || null,
       resultsFile: kv.results_file || null,
     };
+  });
+}
+
+/** 解析 certwork-*.txt（CERT 任务的 AID 与指数在这里，不在 worktodo 中） */
+function parseCertworkFiles() {
+  const files = fs.readdirSync(DATA_DIR).filter((f) => /^certwork(-\d+)?\.txt$/.test(f)).sort();
+  return cachedParse('certwork', files, () => {
+    const list = [];
+    for (const file of files) {
+      const data = safeReadLines(path.join(DATA_DIR, file), 1 * 1024 * 1024);
+      if (!data) continue;
+      data.lines.forEach((line, i) => {
+        // Cert=<aid>,<k>,<b>,<n>,<c>,<bits>
+        const m = /^Cert=([0-9A-F]{32}),\d+,\d+,(\d+),-?\d+,\d+/i.exec(line);
+        if (!m) return;
+        list.push({ file, order: i, exponent: +m[2], worktype: 'CERT', aid: m[1] });
+      });
+    }
+    return list;
   });
 }
 
@@ -600,15 +628,17 @@ function parseWorktodoFiles() {
       const data = safeReadLines(path.join(DATA_DIR, file), 1 * 1024 * 1024);
       if (!data) continue;
       data.lines.forEach((line, i) => {
-        const m = /^([A-Z]+)=([0-9A-F]+),(\d+),(\d+),(\d+),(-?\d+),(\d+)/.exec(line);
+        // 注意：PRPLL 写的 Cert 行是大小写混合的 "Cert="，正则需允许
+        const m = /^([A-Za-z]+)=([0-9A-F]+),(\d+),(\d+),(\d+),(-?\d+),(\d+)/.exec(line);
         if (!m) return;
         const [, type, aid, , , exp, , bits] = m;
+        const wt = type.toUpperCase();
         queue.push({
           file,
           order: i,
           exponent: +exp,
-          worktype: type,
-          worktypeLabel: typeLabel[type] || type,
+          worktype: wt,
+          worktypeLabel: typeLabel[wt] || wt,
           aid,
           bits: +bits,
         });
@@ -651,7 +681,186 @@ function parseResultsFiles() {
   });
 }
 
+/** 读取本地全部结果（含已上报的 results_sent-*），用于历史页合并 CERT 等记录 */
+function parseAllLocalResults() {
+  const files = fs.readdirSync(DATA_DIR).filter((f) => /^results(_sent)?(-\d+)?\.txt$/.test(f)).sort();
+  return cachedParse('results-all', files, () => {
+    const results = [];
+    for (const file of files) {
+      const data = safeReadLines(path.join(DATA_DIR, file), 8 * 1024 * 1024);
+      if (!data) continue;
+      for (const line of data.lines) {
+        try {
+          const j = JSON.parse(line);
+          results.push({
+            exponent: j.exponent,
+            status: j.status,
+            worktype: j.worktype,
+            res64: j.res64,
+            timestamp: j.timestamp,
+            program: j.program ? `${j.program.name} ${j.program.version}` : null,
+          });
+        } catch (e) {
+          // 忽略非 JSON 行
+        }
+      }
+    }
+    results.sort((a, b) => (b.timestamp || '').localeCompare(a.timestamp || ''));
+    return results;
+  });
+}
+
 // ---------------------------------------------------------------- 状态汇总
+
+/** 从 gpuowl 日志计算各指数的总耗时（秒）：首次出现到最后一次出现的间隔 */
+function parseElapsedMap() {
+  return cachedParse('elapsed', ['gpuowl-0.log'], () => {
+    const data = safeReadLines(path.join(DATA_DIR, 'gpuowl-0.log'));
+    if (!data) return {};
+    const first = new Map();
+    const last = new Map();
+    for (const line of data.lines) {
+      const tsM = /^(\d{8}) (\d{2}:\d{2}:\d{2})/.exec(line);
+      if (!tsM) continue;
+      const ts = parseGpuowlTs(tsM[0]);
+      const expM = /^\d{8} \d{2}:\d{2}:\d{2}\s+(\d+)\s+/.exec(line);
+      if (!expM) continue;
+      const exp = parseInt(expM[1], 10);
+      if (!first.has(exp)) first.set(exp, ts);
+      last.set(exp, ts);
+    }
+    const out = {};
+    for (const [exp, t0] of first) {
+      const t1 = last.get(exp);
+      if (t1 && t1 > t0) out[exp] = Math.round((t1 - t0) / 1000);
+    }
+    return out;
+  });
+}
+
+// ---------------------------------------------------------------- 领取任务类型 / 存储统计
+
+/** 领取任务类型选项（PRPLL 支持的 WorkPreference） */
+const WORK_PREFERENCE_OPTIONS = {
+  150: '首次 PRP 测试',
+  151: 'PRP 双重检查',
+  155: 'PRP 双重检查（带证明）',
+  160: '首次 PRP（合数）',
+  161: 'PRP 双重检查（合数）',
+};
+
+function getWorkPreference() {
+  const prime = parseIni();
+  const v = prime && prime.workPreference != null ? prime.workPreference : null;
+  return {
+    ok: true,
+    value: v,
+    label: v != null ? WORK_PREFERENCE_OPTIONS[v] || null : null,
+    options: WORK_PREFERENCE_OPTIONS,
+  };
+}
+
+/** 更新 prime.ini 的 WorkPreference（AutoPrimeNet 每次轮询都会重读配置文件） */
+function setWorkPreference(value) {
+  const v = parseInt(value, 10);
+  if (!(v in WORK_PREFERENCE_OPTIONS)) {
+    return { ok: false, error: '不支持的任务类型: ' + value };
+  }
+  const p = path.join(DATA_DIR, 'prime.ini');
+  let text;
+  try {
+    text = fs.readFileSync(p, 'utf8');
+  } catch (e) {
+    return { ok: false, error: '无法读取 prime.ini' };
+  }
+  const lines = text.split('\n');
+  let replaced = false;
+  const out = lines.map((line) => {
+    const m = /^(\s*WorkPreference\s*=\s*)\d+\s*$/.exec(line);
+    if (m) {
+      replaced = true;
+      return `${m[1]}${v}`;
+    }
+    return line;
+  });
+  if (!replaced) {
+    // 在 [PrimeNet] 段首行后插入一行
+    const res = [];
+    for (const line of out) {
+      res.push(line);
+      if (!replaced && /^\[PrimeNet\]\s*$/.test(line.trim())) {
+        res.push(`WorkPreference = ${v}`);
+        replaced = true;
+      }
+    }
+    if (!replaced) res.push(`WorkPreference = ${v}`);
+    text = res.join('\n');
+  } else {
+    text = out.join('\n');
+  }
+  try {
+    fs.writeFileSync(p, text);
+  } catch (e) {
+    return { ok: false, error: '无法写入 prime.ini' };
+  }
+  // 使配置文件缓存失效，让前端立即读到新值
+  if (fileCache.has('ini')) fileCache.delete('ini');
+  return { ok: true, value: v, label: WORK_PREFERENCE_OPTIONS[v] };
+}
+
+/** 扫描数据目录顶层条目（文件/目录），统计大小与文件数；60s 缓存避免频繁 du */
+let storageCache = { at: 0, data: null };
+function parseStorage() {
+  const now = Date.now();
+  if (storageCache.data && now - storageCache.at < 60 * 1000) return storageCache.data;
+  const out = [];
+  let entries;
+  try {
+    entries = fs.readdirSync(DATA_DIR, { withFileTypes: true });
+  } catch (e) {
+    return [];
+  }
+  for (const ent of entries) {
+    const p = path.join(DATA_DIR, ent.name);
+    try {
+      const st = fs.statSync(p);
+      if (ent.isDirectory()) {
+        let size = 0;
+        let count = 0;
+        const stack = [p];
+        while (stack.length) {
+          const cur = stack.pop();
+          let items;
+          try {
+            items = fs.readdirSync(cur, { withFileTypes: true });
+          } catch (e) {
+            continue;
+          }
+          for (const it of items) {
+            const fp = path.join(cur, it.name);
+            try {
+              if (it.isDirectory()) stack.push(fp);
+              else {
+                size += fs.statSync(fp).size;
+                count++;
+              }
+            } catch (e) {
+              // 忽略无权限/损坏条目
+            }
+          }
+        }
+        out.push({ name: ent.name, type: 'dir', size, count, mtime: st.mtimeMs });
+      } else {
+        out.push({ name: ent.name, type: 'file', size: st.size, count: 1, mtime: st.mtimeMs });
+      }
+    } catch (e) {
+      // 忽略
+    }
+  }
+  out.sort((a, b) => b.size - a.size);
+  storageCache = { at: now, data: out };
+  return out;
+}
 
 function buildStatus() {
   const prpll = parsePrpll();
@@ -666,10 +875,11 @@ function buildStatus() {
   if (apn.rollingAverage == null && prime) apn.rollingAverage = prime.rollingAverage;
   if (apn.msecPerIter == null && prime) apn.msecPerIter = prime.msecPerIter;
 
-  // 用工作队列补全分配信息的任务类型 / AID
+  // 用工作队列 + 证书队列补全分配信息的任务类型 / AID（CERT 任务在 certwork-*.txt）
   const byExp = new Map(queue.map((q) => [q.exponent, q]));
+  const certByExp = new Map(parseCertworkFiles().map((c) => [c.exponent, c]));
   for (const a of apn.assignments) {
-    const q = byExp.get(a.exponent);
+    const q = byExp.get(a.exponent) || certByExp.get(a.exponent);
     if (q) {
       a.worktype = a.worktype || q.worktype;
       a.aid = a.aid || q.aid;
@@ -693,8 +903,11 @@ function buildStatus() {
     prime,
     queue,
     results: parseResultsFiles().slice(0, 20),
+    historyLocal: parseAllLocalResults(),
     files: ['gpuowl-0.log', 'autoprimenet.log', 'worktodo-0.txt', 'worktodo.txt', 'results-0.txt', 'prime.ini', 'config.txt']
       .map(fileInfo),
+    elapsed: parseElapsedMap(),
+    storage: parseStorage(),
   };
 }
 
@@ -992,9 +1205,28 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    if (pathname === '/api/tasks/import' && req.method === 'POST') {
-      const result = await tasks.importFromPrimeNet();
+    if (pathname === '/api/tasks/import/candidates' && req.method === 'POST') {
+      const result = await tasks.getImportCandidates();
       sendJson(res, result.ok ? 200 : 502, result);
+      return;
+    }
+
+    if (pathname === '/api/tasks/import' && req.method === 'POST') {
+      const body = await readJsonBody(req);
+      const result = await tasks.importFromPrimeNet(body.exponents);
+      sendJson(res, result.ok ? 200 : 502, result);
+      return;
+    }
+
+    // 领取任务类型（WorkPreference）
+    if (pathname === '/api/settings/workpreference' && req.method === 'GET') {
+      sendJson(res, 200, getWorkPreference());
+      return;
+    }
+    if (pathname === '/api/settings/workpreference' && req.method === 'POST') {
+      const body = await readJsonBody(req);
+      const result = setWorkPreference(body.value);
+      sendJson(res, result.ok ? 200 : 400, result);
       return;
     }
 

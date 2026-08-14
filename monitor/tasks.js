@@ -351,6 +351,8 @@ async function cancelTask(exponent, unreserve = false, immediate = false) {
   let primeNet = null;
   if (unreserve) {
     primeNet = await mersenne.unreserveByAid(parsed.aid, getComputerGuid());
+    // 取消成功后清掉 PrimeNet 抓取缓存，避免面板继续显示旧分配
+    if (primeNet && primeNet.ok) mersenne.clearCache();
   }
   if (prpll) {
     if (prpll.ok) {
@@ -439,7 +441,8 @@ async function fetchFactoredBits(exponent) {
   return r && r.no_factor_to_bits != null ? r.no_factor_to_bits : null;
 }
 
-async function importFromPrimeNet() {
+/** 获取 PrimeNet 上可导入（本地队列中不存在）的任务候选，不写入文件 */
+async function getImportCandidates() {
   const username = getIniValue('username') || getIniValue('user_name');
   if (!username) {
     return { ok: false, error: 'prime.ini 中未找到用户名（username），无法获取 PrimeNet 分配' };
@@ -457,41 +460,54 @@ async function importFromPrimeNet() {
 
   const aidMap = buildAidMap();
   const typeMap = { PRP: 'PRP', 'PRP-D': 'PRPDC' };
-  const added = [];
-  const skipped = [];
+  const candidates = [];
 
   for (const a of assignments) {
     const exp = a.exponent;
     if (!exp || existing.has(exp)) continue;
     const type = typeMap[a.work_type];
-    if (!type) {
-      skipped.push({ exponent: exp, reason: `不支持的分配类型 ${a.work_type}` });
-      continue;
-    }
+    if (!type) continue;
     const aid = aidMap.get(exp);
-    if (!aid) {
-      skipped.push({ exponent: exp, reason: '未找到 AID（autoprimenet.log 中无记录）' });
-      continue;
-    }
+    if (!aid) continue;
     let bits = 0;
     try {
       bits = await fetchFactoredBits(exp);
     } catch (e) {
-      skipped.push({ exponent: exp, reason: '获取试除位数失败：' + e.message });
       continue;
     }
-    if (bits == null) {
-      skipped.push({ exponent: exp, reason: '服务器未返回试除位数' });
-      continue;
-    }
-    const line = `${type}=${aid},1,2,${exp},-1,${bits},0`;
-    await withLock(dataPath('worktodo-0.txt'), () => {
-      appendLineToFile('worktodo-0.txt', line);
+    if (bits == null) continue;
+    candidates.push({
+      exponent: exp,
+      type,
+      aid,
+      bits,
+      line: `${type}=${aid},1,2,${exp},-1,${bits},0`,
     });
-    added.push({ exponent: exp, type, line });
-    existing.add(exp);
   }
-  return { ok: true, added, skipped, totalAssignments: assignments.length };
+  candidates.sort((a, b) => a.exponent - b.exponent);
+  return { ok: true, candidates, totalAssignments: assignments.length };
+}
+
+/** 导入所选候选；selectedExponents 为空数组/未提供时导入全部候选 */
+async function importFromPrimeNet(selectedExponents) {
+  const prep = await getImportCandidates();
+  if (!prep.ok) return prep;
+
+  const selected = new Set(
+    (Array.isArray(selectedExponents) ? selectedExponents : []).map((e) => parseInt(e, 10))
+  );
+  const toImport = selected.size
+    ? prep.candidates.filter((c) => selected.has(c.exponent))
+    : prep.candidates;
+
+  const added = [];
+  for (const c of toImport) {
+    await withLock(dataPath('worktodo-0.txt'), () => {
+      appendLineToFile('worktodo-0.txt', c.line);
+    });
+    added.push({ exponent: c.exponent, type: c.type, line: c.line });
+  }
+  return { ok: true, added, candidates: prep.candidates, totalAssignments: prep.totalAssignments };
 }
 
 // ---------------------------------------------------------------- 汇总
@@ -522,5 +538,6 @@ module.exports = {
   resumeTask,
   cancelTask,
   addTasks,
+  getImportCandidates,
   importFromPrimeNet,
 };

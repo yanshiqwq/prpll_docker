@@ -6,6 +6,7 @@
   const POLL_MS = 5000;
   const LOG_LINES = 300;
   const DAY_MS = 24 * 3600 * 1000;
+  const MAX_SNAPSHOT = 2000; // 日志快照保留的最大行数（防止长时间运行内存膨胀）
 
   let statusData = null;
   let lastHealth = null;
@@ -21,6 +22,10 @@
   let cancelTarget = null;
   let pauseTarget = null;
   let pendingCancel = null;
+  let chartRange = '24h'; // '1h' | '6h' | '24h' | '7d' | 'all'
+  let importCandidates = [];
+  let seenPrimeExps = new Set(); // 已触发过素数弹窗的指数，避免重复
+  const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
 
   // ---------------------------------------------------------------- 工具函数
   const pad = (n, w = 2) => String(n).padStart(w, '0');
@@ -78,6 +83,23 @@
       .replace(/"/g, '&quot;');
   }
 
+  /** 转义正则特殊字符，用于关键词高亮 */
+  function escapeRegExp(s) {
+    return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+
+  /** 字节数 -> 人类可读 */
+  function fmtBytes(n) {
+    if (n == null || Number.isNaN(n)) return '—';
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let v = n, i = 0;
+    while (v >= 1024 && i < units.length - 1) {
+      v /= 1024;
+      i++;
+    }
+    return (i ? v.toFixed(1) : v.toFixed(0)) + ' ' + units[i];
+  }
+
   function setBadge(el, status, text) {
     el.className = 'badge ' + (status || 'neutral');
     el.textContent = text;
@@ -90,11 +112,11 @@
   function workTypeLabel(t) {
     const map = {
       PRP: 'PRP',
-      'PRP-D': 'PRP 双重检查',
-      PRPDC: 'PRP 双重检查',
+      'PRP-D': 'PRP 复查',
+      PRPDC: 'PRP 复查',
       LL: 'LL',
-      'LL-D': 'LL 双重检查',
-      LLDC: 'LL 双重检查',
+      'LL-D': 'LL 复查',
+      LLDC: 'LL 复查',
       CERT: '证书验证',
       TF: '试除',
       'P-1': 'P-1',
@@ -102,6 +124,12 @@
       ECM: 'ECM',
     };
     return map[t] || t || '?';
+  }
+
+  /** AID 缩略显示（省略号），悬浮显示完整值 */
+  function aidHtml(aid) {
+    if (!aid || !/^[0-9A-F]{32}$/i.test(aid)) return '';
+    return ` · <span class="aid" title="${esc(aid)}">${esc(aid.slice(0, 8))}…</span>`;
   }
 
   function workTypeClass(t) {
@@ -138,20 +166,23 @@
   }
 
   // ---------------------------------------------------------------- 时钟与刷新
+  /** 下次签到倒计时文本（未设置时返回占位） */
+  function countdownText(ts) {
+    if (ts == null || Number.isNaN(ts)) return '…';
+    const remain = Math.max(0, (ts - Date.now()) / 1000);
+    return fmtDur(remain) + (remain > 0 ? ' 后' : '');
+  }
+
   function initClock() {
     const tick = () => {
       $('#clock').textContent = fmtClock(Date.now());
       if (apnNextCheckTs != null && $('#apnNextCheck')) {
-        const remain = Math.max(0, (apnNextCheckTs - Date.now()) / 1000);
-        $('#apnNextCheck').textContent = fmtDur(remain) + (remain > 0 ? ' 后' : '');
+        $('#apnNextCheck').textContent = countdownText(apnNextCheckTs);
         $('#apnNextCheck').title = fmtDateTime(apnNextCheckTs);
       }
     };
     tick();
     setInterval(tick, 1000);
-    $('#refreshBtn').addEventListener('click', () => {
-      loadStatus(true);
-    });
   }
 
   // ---------------------------------------------------------------- 状态渲染
@@ -187,7 +218,19 @@
     renderApn(s.apn, s.prime);
     renderQueue(s.queue);
     renderResults(s.results);
+    renderFiles(s.storage);
     drawCharts(s.prpll);
+
+    // 梅森素数检测：出现 status=P 的新结果即触发全屏弹窗
+    const primeHits = [...(s.results || []), ...(s.historyLocal || [])].filter(
+      (r) => String(r.status || '').toUpperCase() === 'P'
+    );
+    for (const r of primeHits) {
+      if (r.exponent && !seenPrimeExps.has(r.exponent)) {
+        seenPrimeExps.add(r.exponent);
+        triggerPrimeOverlay(r.exponent);
+      }
+    }
 
     // 状态变化提醒
     if (lastHealth && lastHealth !== s.health && window.mdui && mdui.snackbar) {
@@ -262,7 +305,7 @@
         </div>`
       );
       rows.push(
-        `<div class="kv-list">
+        `<div class="kv-list kv-list--2">
           ${kvRow('pin', '迭代进度', `<b>${fmtNum(w.iteration)}</b> / ${fmtNum(w.exponent)}`)}
           ${kvRow('timer', '预计完成', w.etaSec != null ? `<span class="timer">${fmtDur(w.etaSec)}</span><br><small style="font-weight:400">${fmtDateTime(w.etaAt)}</small>` : '—')}
           ${kvRow('bolt', '计算速度', w.itersPerSec != null ? `${w.itersPerSec.toFixed(1)} 迭代/秒` : '—')}
@@ -273,7 +316,7 @@
           ${kvRow('key', '证明文件', w.proofPower != null ? `${fmtNum(w.proofCount || 0)} / ${Math.pow(2, w.proofPower)} 块（2^${w.proofPower}）` : '—')}
           ${kvRow('history', '本次运行', w.sessionSinceSec != null ? fmtDur(w.sessionSinceSec) : '—')}
           ${kvRow('restart_alt', '重启次数', fmtNum(w.startCount || 0))}
-          ${kvRow('memory', '设备', esc(w.device || '—'))}
+          ${kvRow('memory', '环境', esc(w.device || '—'))}
         </div>`
       );
     } else {
@@ -298,11 +341,12 @@
 
     apnNextCheckTs = apn.nextCheck ? new Date(apn.nextCheck.replace(' ', 'T')).getTime() : null;
 
-    let html = `<div class="kv-list">`;
+    let html = `<div class="kv-list kv-list--2">`;
     html += kvRow('person', 'PrimeNet 用户', esc(apn.user || '—'));
     html += kvRow('desktop_windows', '设备', esc(apn.cpuBrand || '—'));
     html += kvRow('schedule', '上次签到', esc(apn.lastCheck || '—'));
-    html += kvRow('event_available', '下次签到', apn.nextCheck ? `<span class="timer" id="apnNextCheck">…</span><br><small style="font-weight:400">${esc(apn.nextCheck)}</small>` : '—');
+    // 重绘时直接渲染真实倒计时，避免每 5 秒刷新闪一下占位符
+    html += kvRow('event_available', '下次签到', apn.nextCheck ? `<span class="timer" id="apnNextCheck" title="${esc(fmtDateTime(apnNextCheckTs))}">${countdownText(apnNextCheckTs)}</span><br><small style="font-weight:400">${esc(apn.nextCheck)}</small>` : '—');
     html += kvRow('autorenew', '检查间隔', apn.checkIntervalH ? `${apn.checkIntervalH} 小时` : '—');
     html += kvRow(
       'hourglass_bottom',
@@ -318,25 +362,17 @@
     html += `</div>`;
 
     if (apn.assignments && apn.assignments.length) {
-      html += `<div class="sub-list"><div class="sub-list-title">当前分配（${apn.assignments.length}）</div>`;
+      html += `<div class="sub-list list-scroll"><div class="sub-list-title">当前分配（${apn.assignments.length}）</div>`;
       for (const a of apn.assignments) {
         const typeClass = a.worktype === 'PRPDC' ? 'dc' : a.worktype === 'CERT' ? 'cert' : '';
         html += `<div class="sub-row">
           <span class="type-badge ${typeClass}">${esc(a.worktype || '?')}</span>
           <div class="main">
             <div class="t1">M${fmtNum(a.exponent)}</div>
-            <div class="t2">${esc(a.doneDate || '')}${a.aid ? ' · ' + esc(a.aid.slice(0, 8)) + '…' : ''}</div>
+            <div class="t2">${esc(a.doneDate || '')}${aidHtml(a.aid)}</div>
           </div>
           <div class="right">${esc(a.etaText || '—')}</div>
         </div>`;
-      }
-      html += `</div>`;
-    }
-
-    if (apn.warningCount) {
-      html += `<div class="sub-list"><div class="sub-list-title">最近警告（${apn.warningCount}）</div>`;
-      for (const w of apn.warnings) {
-        html += `<div class="warn-row ${w.level === 'ERROR' ? 'error' : ''}">${esc(w.text)}</div>`;
       }
       html += `</div>`;
     }
@@ -359,7 +395,7 @@
           <span class="type-badge ${typeClass}">${esc(q.worktypeLabel || q.worktype)}</span>
           <div class="main">
             <div class="t1">M${fmtNum(q.exponent)}</div>
-            <div class="t2">${esc(q.file)} · 已试除 ${fmtNum(q.bits)} bits${q.aid ? ' · ' + esc(q.aid.slice(0, 8)) + '…' : ''}</div>
+            <div class="t2">${esc(q.file)} · 已试除 ${fmtNum(q.bits)} bits${aidHtml(q.aid)}</div>
           </div>
           <div class="right">#${i + 1}</div>
         </div>`;
@@ -397,7 +433,73 @@
       .join('');
   }
 
+  // ---- 数据与磁盘 ----
+  function fileIcon(name) {
+    if (/gpuowl|autoprimenet|\.log$/.test(name)) return 'article';
+    if (/worktodo/.test(name)) return 'playlist_play';
+    if (/results/.test(name)) return 'fact_check';
+    if (/prime\.ini/.test(name)) return 'settings';
+    if (/config/.test(name)) return 'tune';
+    return 'insert_drive_file';
+  }
+
+  function renderFiles(storage) {
+    // prpll 模式只有 worktodo-{n}.txt，没有 worktodo.txt；~lock 是锁文件，均过滤
+    let list = (storage || []).filter((f) => f.name !== 'worktodo.txt' && f.name !== '~lock');
+
+    // 把分散的 *.cert 证书文件聚合为一个虚拟 "cert/" 目录，保持列表简洁
+    const certs = list.filter((f) => f.type !== 'dir' && /\.cert$/i.test(f.name));
+    if (certs.length) {
+      list = [
+        {
+          name: 'cert',
+          type: 'dir',
+          size: certs.reduce((s, c) => s + (c.size || 0), 0),
+          count: certs.length,
+          mtime: Math.max(...certs.map((c) => c.mtime || 0)),
+          virtual: true,
+        },
+        ...list.filter((f) => !(f.type !== 'dir' && /\.cert$/i.test(f.name))),
+      ];
+    }
+    list.sort((a, b) => (b.size || 0) - (a.size || 0));
+
+    const total = list.reduce((s, f) => s + (f.size || 0), 0);
+    const dirs = list.filter((f) => f.type === 'dir');
+    const files = list.filter((f) => f.type !== 'dir');
+    $('#filesSummary').textContent = list.length
+      ? `${dirs.length} 个目录 · ${files.length} 个文件 · 合计 ${fmtBytes(total)}`
+      : '暂无数据';
+    const box = $('#filesList');
+    if (!list.length) {
+      box.innerHTML = `<div class="empty">暂无数据</div>`;
+      return;
+    }
+    box.innerHTML = list
+      .map((f) => {
+        const ageSec = f.mtime ? Math.max(0, (Date.now() - f.mtime) / 1000) : null;
+        const isDir = f.type === 'dir';
+        const detail = isDir
+          ? `${fmtBytes(f.size)} · ${f.virtual ? `${fmtNum(f.count)} 个证书` : `${fmtNum(f.count)} 个文件`} · ${fmtDur(ageSec)} 前更新`
+          : `${fmtBytes(f.size)} · ${fmtDur(ageSec)} 前更新`;
+        return `<div class="sub-row file-row">
+          <mdui-icon name="${isDir ? 'folder' : fileIcon(f.name)}" class="file-icon ${isDir ? 'dir' : ''}"></mdui-icon>
+          <div class="main">
+            <div class="t1 mono">${esc(f.name)}${isDir ? '/' : ''}</div>
+            <div class="t2">${detail}</div>
+          </div>
+          <div class="right">${fmtClock(f.mtime)}</div>
+        </div>`;
+      })
+      .join('');
+  }
+
   // ---------------------------------------------------------------- 图表
+  function chartRangeMs() {
+    const map = { '1h': 3600e3, '6h': 6 * 3600e3, '24h': 24 * 3600e3, '7d': 7 * 24 * 3600e3, all: Infinity };
+    return map[chartRange] != null ? map[chartRange] : Infinity;
+  }
+
   function drawCharts(prpll) {
     const worker = prpll.workers && prpll.workers[0];
     if (!worker) {
@@ -407,21 +509,24 @@
     }
     const progress = worker.history ? worker.history.progress : [];
     const speed = worker.history ? worker.history.speed : [];
+    const since = Date.now() - chartRangeMs();
+    const progInRange = progress.filter((p) => p[0] >= since);
+    const speedInRange = speed.filter((p) => p[0] >= since);
 
-    drawLineChart($('#progressChart'), progress, {
+    drawLineChart($('#progressChart'), progInRange, {
+      yAuto: true, // 纵轴按数据范围自动缩放（限制在 0~100）
       yMin: 0,
       yMax: 100,
       yFmt: (v) => v.toFixed(0) + '%',
       label: worker.exponent ? `M${fmtNumCompact(worker.exponent)}` : '',
-      emptyText: '暂无进度数据',
+      emptyText: '该时间范围暂无数据',
     });
 
-    const dayAgo = Date.now() - DAY_MS;
-    const speed24 = speed.filter((p) => p[0] >= dayAgo);
-    drawLineChart($('#speedChart'), speed24, {
+    drawLineChart($('#speedChart'), speedInRange, {
+      yAuto: true, // 纵轴按数据范围自动缩放
       yFmt: (v) => fmtNumCompact(v) + '/s',
       label: worker.itersPerSec != null ? `${worker.itersPerSec.toFixed(1)} 迭代/秒` : '',
-      emptyText: '24 小时内暂无数据',
+      emptyText: '该时间范围暂无数据',
       showAvg: true,
     });
   }
@@ -443,6 +548,14 @@
   function cssVar(name) {
     const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
     return v ? `rgb(${v})` : '#888';
+  }
+
+  /** MDUI 的 CSS 变量是 "r g b" 空格分隔，转成带透明度的 rgba */
+  function cssVarRgba(name, alpha) {
+    const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+    const m = /^([\d.]+)\s+([\d.]+)\s+([\d.]+)$/.exec(v);
+    if (m) return `rgba(${m[1]}, ${m[2]}, ${m[3]}, ${alpha})`;
+    return `rgba(30, 136, 229, ${alpha})`;
   }
 
   function drawLineChart(canvas, points, opts) {
@@ -469,8 +582,23 @@
 
     const t0 = points[0][0];
     const t1 = points[points.length - 1][0];
-    const yMin = opts.yMin != null ? opts.yMin : Math.min(0, ...points.map((p) => p[1])) * 0.9;
-    const yMax = opts.yMax != null ? opts.yMax : Math.max(...points.map((p) => p[1])) * 1.1;
+    const vals = points.map((p) => p[1]);
+    const dataMin = Math.min(...vals);
+    const dataMax = Math.max(...vals);
+    let yMin, yMax;
+    if (opts.yAuto) {
+      // 纵轴按数据范围自动缩放，让趋势可见；可选的 yMin/yMax 作为硬边界
+      const pad = Math.max(1, (dataMax - dataMin) * 0.1);
+      yMin = Math.max(opts.yMin != null ? opts.yMin : -Infinity, dataMin - pad);
+      yMax = Math.min(opts.yMax != null ? opts.yMax : Infinity, dataMax + pad);
+    } else {
+      yMin = opts.yMin != null ? opts.yMin : Math.min(0, dataMin) * 0.9;
+      yMax = opts.yMax != null ? opts.yMax : dataMax * 1.1;
+    }
+    if (yMax - yMin < 1e-9) {
+      yMin -= 1;
+      yMax += 1;
+    }
     const span = Math.max(1, t1 - t0);
     const x = (t) => padL + ((t - t0) / span) * iw;
     const y = (v) => padT + (1 - (v - yMin) / (yMax - yMin || 1)) * ih;
@@ -529,8 +657,8 @@
     ctx.stroke();
 
     const grad = ctx.createLinearGradient(0, padT, 0, h - padB);
-    grad.addColorStop(0, 'rgba(33, 150, 243, 0.18)');
-    grad.addColorStop(1, 'rgba(33, 150, 243, 0)');
+    grad.addColorStop(0, cssVarRgba('--mdui-color-primary', 0.18));
+    grad.addColorStop(1, cssVarRgba('--mdui-color-primary', 0));
     ctx.fillStyle = grad;
     ctx.beginPath();
     ctx.moveTo(x(points[0][0]), h - padB);
@@ -595,6 +723,8 @@
     const summary = d.summary || {};
     const activeComps = (summary.activeComputers || []).join('、') || '—';
     const allComps = (summary.computers || []).join('、') || '—';
+    // 本地 CERT 历史（PrimeNet 报表不含 CERT，从本地结果统计）
+    const certCount = ((statusData && statusData.historyLocal) || []).filter((r) => /^Cert/i.test(r.worktype || '')).length;
 
     $('#pnBody').innerHTML = `
       <div class="kv-list">
@@ -602,7 +732,7 @@
         ${kvRow('desktop_windows', '活跃计算机', esc(activeComps))}
         ${kvRow('dns', 'PrimeNet 时间', esc(d.primeNetTime ? fmtLocal(d.primeNetTime.replace('T', ' ').slice(0, 19)) : '—'))}
         ${kvRow('update', '数据抓取时间', d.fetchedAt ? `${fmtDateTime(d.fetchedAt)}${fetchedAgo != null ? `（${fmtDur(fetchedAgo)} 前）` : ''}` : '—')}
-        ${kvRow('verified', '历史结果', `${fmtNum(summary.total || 0)} 条（LL ${fmtNum(summary.ll || 0)} · PRP ${fmtNum(summary.prp || 0)}）`)}
+        ${kvRow('verified', '历史结果', `${fmtNum(summary.total || 0)} 条（LL ${fmtNum(summary.ll || 0)} · PRP ${fmtNum(summary.prp || 0)}${certCount ? ' · CERT ' + fmtNum(certCount) : ''}）`)}
         ${kvRow('event', '最近完成', summary.lastResult ? `M${fmtNum(summary.lastResult.exponent)}（${esc(summary.lastResult.type)} · ${esc(summary.lastResult.date || '')}）` : '—')}
       </div>
     `;
@@ -619,6 +749,7 @@
         ${kvRow('fact_check', '结果总数', fmtNum(summary.total || 0))}
         ${kvRow('memory', 'LL 结果', fmtNum(summary.ll || 0))}
         ${kvRow('science', 'PRP 结果', fmtNum(summary.prp || 0))}
+        ${kvRow('verified', 'CERT 结果', fmtNum(certCount || 0))}
         ${kvRow('desktop_windows', '历史计算机', esc(allComps))}
         ${kvRow('calendar_month', '按年份', years || '—')}
       </div>
@@ -659,17 +790,54 @@
       .join('');
   }
 
-  function renderHistoryTable() {
+  /** 本地计算机名（用于高亮本机完成的任务） */
+  function localComputerName() {
+    return (statusData && statusData.prime && statusData.prime.computerId) || null;
+  }
+
+  /** 合并 PrimeNet 历史 + 本地 CERT 记录，并补充总耗时 / 本机标记 */
+  function getAllHistoryRows() {
     const d = mersenneData;
-    const body = $('#histBody');
-    const countEl = $('#histCount');
-    if (!d || !d.results) {
-      body.innerHTML = `<tr class="empty-row"><td colspan="6">暂无数据</td></tr>`;
-      countEl.textContent = '';
-      return;
+    const base = (d && d.results) || [];
+    const elapsed = (statusData && statusData.elapsed) || {};
+    const localName = localComputerName();
+
+    // PrimeNet 历史（LL / PRP）
+    const primeRows = base.map((r) => ({
+      ...r,
+      local: localName ? String(r.computer || '').toLowerCase().includes(localName.toLowerCase()) : false,
+      elapsedSec: elapsed[r.exponent] != null ? elapsed[r.exponent] : null,
+    }));
+
+    // 本地结果：只取 CERT（LL/PRP 以 PrimeNet 为准），去重取最新一条
+    const certMap = new Map();
+    for (const r of statusData && statusData.historyLocal ? statusData.historyLocal : []) {
+      if (!/^Cert/i.test(r.worktype || '')) continue;
+      if (!certMap.has(r.exponent) || (r.timestamp || '') > (certMap.get(r.exponent).timestamp || '')) {
+        certMap.set(r.exponent, r);
+      }
     }
+    const certRows = [...certMap.values()].map((r) => ({
+      type: 'CERT',
+      exponent: r.exponent,
+      residue: r.res64 || '—',
+      computer: '本机',
+      software: r.program || '—',
+      date: r.timestamp || '',
+      dateTs: null, // 本地时间戳，直接展示
+      local: true,
+      elapsedSec: elapsed[r.exponent] != null ? elapsed[r.exponent] : null,
+    }));
+
+    const rows = [...primeRows, ...certRows];
+    return { rows, total: rows.length };
+  }
+
+  /** 按当前关键词 / 类型筛选并排序的历史结果行 */
+  function getHistoryRows() {
+    const { rows } = getAllHistoryRows();
     const keyword = ($('#histFilter').value || '').trim().toLowerCase();
-    const rows = (d.results || [])
+    return rows
       .filter((r) => histTypeFilter === 'ALL' || r.type === histTypeFilter)
       .filter((r) => {
         if (!keyword) return true;
@@ -681,21 +849,32 @@
         );
       })
       .sort((a, b) => (b.dateTs || b.date || '').localeCompare(a.dateTs || a.date || ''));
+  }
 
-    countEl.textContent = `共 ${d.results.length} 条，显示 ${rows.length} 条`;
+  function renderHistoryTable() {
+    const body = $('#histBody');
+    const countEl = $('#histCount');
+    const { total } = getAllHistoryRows();
+    const rows = getHistoryRows();
+    countEl.textContent = total ? `共 ${total} 条，显示 ${rows.length} 条` : '';
+    if (!total) {
+      body.innerHTML = `<tr class="empty-row"><td colspan="7">暂无数据</td></tr>`;
+      return;
+    }
     if (!rows.length) {
-      body.innerHTML = `<tr class="empty-row"><td colspan="6">没有匹配的任务</td></tr>`;
+      body.innerHTML = `<tr class="empty-row"><td colspan="7">没有匹配的任务</td></tr>`;
       return;
     }
     body.innerHTML = rows
       .map(
-        (r) => `<tr>
-          <td><span class="type-badge ${workTypeClass(r.type)}">${esc(r.type || '?')}</span></td>
+        (r) => `<tr class="${r.local ? 'row-local' : ''}">
+          <td><span class="type-badge ${workTypeClass(r.type)}">${esc(workTypeLabel(r.type))}</span></td>
           <td><a class="exp-link" href="https://www.mersenne.org/M${r.exponent}" target="_blank" rel="noopener">M${fmtNum(r.exponent)}</a></td>
-          <td class="residue">${esc(r.residue || '—')}</td>
-          <td>${esc(r.computer || '—')}</td>
-          <td>${esc(r.software || '—')}</td>
-          <td>${esc(r.dateTs ? fmtLocal(r.dateTs.slice(0, 19)) : r.date || '—')}</td>
+          <td class="residue truncate" title="${esc(r.residue || '')}">${esc(r.residue || '—')}</td>
+          <td class="truncate" title="${esc(r.computer || '')}">${esc(r.computer || '—')}${r.local ? ' <span class="tag-local">本机</span>' : ''}</td>
+          <td class="truncate" title="${esc(r.software || '')}">${esc(r.software || '—')}</td>
+          <td class="truncate" title="${esc(r.dateTs ? fmtLocal(r.dateTs.slice(0, 19)) : r.date || '—')}">${esc(r.dateTs ? fmtLocal(r.dateTs.slice(0, 19)) : r.date || '—')}</td>
+          <td>${r.elapsedSec != null ? fmtDur(r.elapsedSec) : '—'}</td>
         </tr>`
       )
       .join('');
@@ -720,6 +899,29 @@
       renderHistoryTable();
     });
 
+    // 导出 CSV（带 BOM，Excel 可直接打开中文）
+    $('#histExportBtn').addEventListener('click', () => {
+      const rows = getHistoryRows();
+      if (!rows.length) {
+        mdui.snackbar({ message: '没有可导出的数据' });
+        return;
+      }
+      const csvCell = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+      const head = ['类型', '指数', 'Residue', '计算机', '软件', '完成日期', '总耗时'];
+      const lines = rows.map((r) =>
+        [r.type, r.exponent, r.residue, r.computer, r.software, r.dateTs || r.date, r.elapsedSec != null ? fmtDur(r.elapsedSec) : '']
+          .map(csvCell)
+          .join(',')
+      );
+      const csv = '\ufeff' + [head.map(csvCell).join(','), ...lines].join('\n');
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
+      a.download = `gimps-history-${new Date().toISOString().slice(0, 10)}.csv`;
+      a.click();
+      URL.revokeObjectURL(a.href);
+      mdui.snackbar({ message: `已导出 ${rows.length} 条记录` });
+    });
+
     // 预取，进入页面即可见
     loadMersenne(false);
   }
@@ -742,13 +944,47 @@
     return w && w.exponent ? w.exponent : null;
   }
 
+  /** 生成任务的进度/状态信息块（用于取消任务 / 取消 PrimeNet 分配对话框） */
+  function taskProgressHtml(exp) {
+    const w = statusData && statusData.prpll && statusData.prpll.workers && statusData.prpll.workers[0];
+    const isRunning = w && w.exponent === exp;
+    const paused = tasksData && (tasksData.paused || []).some((p) => p.exponent === exp);
+    const assign = statusData && statusData.apn && statusData.apn.assignments.find((a) => a.exponent === exp);
+    const q = statusData && statusData.queue && statusData.queue.find((x) => x.exponent === exp);
+
+    const statusVal = isRunning
+      ? '<span class="v ok-text">运行中</span>'
+      : paused
+        ? '<span class="v warn-text">已暂停</span>'
+        : '<span class="v">排队中</span>';
+    const typeLabel = (q && (q.worktypeLabel || q.worktype)) || (assign && assign.worktype) || null;
+    const eta = assign ? assign.etaText || assign.doneDate || '—' : '—';
+
+    let bar = '';
+    const rows = [
+      kvRow('play_circle', '运行状态', statusVal),
+      kvRow('category', '任务类型', esc(typeLabel || '—')),
+      kvRow('timer', '预计完成', esc(eta)),
+    ];
+    if (isRunning && w) {
+      rows.push(kvRow('pin', '迭代进度', `<b>${fmtNum(w.iteration)}</b> / ${fmtNum(w.exponent)}`));
+      rows.push(kvRow('bolt', '计算速度', w.itersPerSec != null ? `${w.itersPerSec.toFixed(1)} 迭代/秒` : '—'));
+      if (w.percent != null) {
+        bar = `<div class="progress-row dialog-bar"><mdui-linear-progress value="${Math.min(1, Math.max(0, w.percent / 100))}"></mdui-linear-progress><span class="progress-pct">${w.percent.toFixed(2)}%</span></div>`;
+      }
+    } else if (q) {
+      rows.push(kvRow('data_object', '试除位数', `${fmtNum(q.bits)} bits${aidHtml(q.aid)}`));
+    }
+    return `<div class="dialog-status">${bar}<div class="kv-list kv-list--2">${rows.join('')}</div></div>`;
+  }
+
   function taskRowHtml(t, actions, running) {
     const isRunning = running && t.exponent === running;
     return `<div class="sub-row task-row ${isRunning ? 'running' : ''}">
       <span class="type-badge ${workTypeClass(t.type)}">${esc(workTypeLabel(t.type))}</span>
       <div class="main">
         <div class="t1">M${fmtNum(t.exponent)}${isRunning ? '<span class="running-tag">运行中</span>' : ''}</div>
-        <div class="t2">${esc(t.file || '')}${t.lineNo ? ' · 第 ' + t.lineNo + ' 行' : ''}${t.bits != null ? ' · 已试除 ' + fmtNum(t.bits) + ' bits' : ''}${t.aid && /^[0-9A-F]{32}$/i.test(t.aid) ? ' · ' + esc(t.aid.slice(0, 8)) + '…' : ''}</div>
+        <div class="t2">${esc(t.file || '')}${t.lineNo ? ' · 第 ' + t.lineNo + ' 行' : ''}${t.bits != null ? ' · 已试除 ' + fmtNum(t.bits) + ' bits' : ''}${aidHtml(t.aid)}</div>
       </div>
       <div class="task-actions">${actions}</div>
     </div>`;
@@ -858,8 +1094,9 @@
       $('#cancelTaskDialog').open = false;
       cancelTarget = null;
       if (unreserve) {
-        // 不可撤销操作：二次确认
+        // 不可撤销操作：二次确认，附上任务进度/状态
         pendingCancel = { exponent: exp, unreserve, immediate };
+        $('#confirm2Info').innerHTML = taskProgressHtml(exp);
         $('#confirm2Dialog').open = true;
       } else {
         await doCancel(exp, unreserve, immediate);
@@ -885,6 +1122,11 @@
       });
       const base = `已取消 M${fmtNum(r.exponent || exp)}${immediate && r.prpll ? '（立即生效）' : ''}`;
       showTaskResult(r, base);
+      if (r && r.primeNet && r.primeNet.ok) {
+        mdui.snackbar({ message: '已在 PrimeNet 取消分配（服务器同步可能稍有延迟）' });
+        // 刷新 PrimeNet 账户数据，让取消立即反映
+        if (mersenneLoaded) loadMersenne(true);
+      }
       if (r && r.primeNet && !r.primeNet.ok) {
         mdui.snackbar({ message: r.primeNet.error || r.primeNet.message || 'PrimeNet 同步取消失败' });
       }
@@ -941,7 +1183,8 @@
         const isRunning = exp === runningExponent();
         $('#cancelTaskInfo').innerHTML =
           `确定取消 <b>M${fmtNum(exp)}</b> 吗？将从工作队列中移除。` +
-          (isRunning ? '<br><b>该任务正在运行</b>，默认在完成当前指数后才生效。' : '');
+          (isRunning ? '<br><b>该任务正在运行</b>，默认在完成当前指数后才生效。' : '') +
+          taskProgressHtml(exp);
         $('#cancelUnreserve').checked = true;
         $('#cancelImmediateBox').classList.toggle('hidden', !isRunning);
         $('#cancelImmediate').checked = false;
@@ -951,21 +1194,108 @@
     $('#taskFiles').addEventListener('click', handleAction);
     $('#taskPaused').addEventListener('click', handleAction);
 
-    // 一键导入
+    // ---- 导入 PrimeNet 任务（多选对话框） ----
+    function syncImportChecks() {
+      const checked = new Set(
+        Array.from(document.querySelectorAll('#importList mdui-checkbox'))
+          .filter((el) => el.checked)
+          .map((el) => parseInt(el.dataset.exp, 10))
+      );
+      importCandidates.forEach((c) => (c._checked = checked.has(c.exponent)));
+      const total = importCandidates.length;
+      $('#importSelectAll').checked = total > 0 && checked.size === total;
+      $('#importCount').textContent = total ? `共 ${total} 个候选，已选 ${checked.size}` : '';
+      // 没有勾选任何任务时禁用"导入选中"
+      $('#importConfirm').disabled = checked.size === 0;
+    }
+
+    function renderImportList() {
+      const list = $('#importList');
+      if (!importCandidates.length) {
+        list.innerHTML = `<div class="empty">没有可导入的任务（本地队列已包含全部 PrimeNet 分配）</div>`;
+        $('#importSelectAll').checked = false;
+        $('#importCount').textContent = '';
+        $('#importConfirm').disabled = true;
+        return;
+      }
+      list.innerHTML = importCandidates
+        .map(
+          (c) => `<label class="import-item">
+            <mdui-checkbox data-exp="${c.exponent}"></mdui-checkbox>
+            <span class="type-badge ${workTypeClass(c.type)}">${esc(workTypeLabel(c.type))}</span>
+            <span class="import-exp">M${fmtNum(c.exponent)}</span>
+            <span class="import-aid" title="${esc(c.aid)}">${esc(c.aid.slice(0, 8))}…</span>
+            <span class="import-bits">已试除 ${fmtNum(c.bits)} bits</span>
+          </label>`
+        )
+        .join('');
+      list.querySelectorAll('mdui-checkbox').forEach((el) => {
+        const exp = parseInt(el.dataset.exp, 10);
+        const c = importCandidates.find((x) => x.exponent === exp);
+        if (c) el.checked = c._checked !== false;
+      });
+      syncImportChecks();
+    }
+
     $('#taskImportBtn').addEventListener('click', async () => {
-      const btn = $('#taskImportBtn');
+      // 立即弹出窗口，列表先显示"加载中"，确认按钮禁用，等候选返回后再启用
+      importCandidates = [];
+      $('#importTip').classList.add('hidden');
+      $('#importList').innerHTML = `<div class="empty import-loading"><mdui-circular-progress></mdui-circular-progress><span>正在加载 PrimeNet 分配…</span></div>`;
+      $('#importCount').textContent = '';
+      $('#importConfirm').disabled = true;
+      $('#importDialog').open = true;
+      try {
+        const r = await fetch('/api/tasks/import/candidates', { method: 'POST' }).then((x) => x.json());
+        if (r && r.ok) {
+          importCandidates = (r.candidates || []).map((c) => ({ ...c, _checked: true }));
+          renderImportList();
+        } else {
+          $('#importTip').classList.remove('hidden');
+          $('#importTip').innerHTML = `获取 PrimeNet 分配失败：${esc((r && r.error) || '未知错误')}`;
+          $('#importList').innerHTML = `<div class="empty">加载失败</div>`;
+        }
+      } catch (e) {
+        $('#importTip').classList.remove('hidden');
+        $('#importTip').innerHTML = `获取 PrimeNet 分配失败：${esc(e.message)}`;
+        $('#importList').innerHTML = `<div class="empty">加载失败</div>`;
+      }
+    });
+
+    $('#importSelectAll').addEventListener('change', () => {
+      const on = $('#importSelectAll').checked;
+      document.querySelectorAll('#importList mdui-checkbox').forEach((el) => (el.checked = on));
+      syncImportChecks();
+    });
+    // 反选：勾选状态取反（全选复选框与计数随之同步）
+    $('#importSelectInvert').addEventListener('click', () => {
+      document.querySelectorAll('#importList mdui-checkbox').forEach((el) => (el.checked = !el.checked));
+      syncImportChecks();
+    });
+    $('#importList').addEventListener('change', syncImportChecks);
+    $('#importCancel').addEventListener('click', () => {
+      $('#importDialog').open = false;
+    });
+    $('#importConfirm').addEventListener('click', async () => {
+      const btn = $('#importConfirm');
+      const selected = importCandidates.filter((c) => c._checked).map((c) => c.exponent);
+      if (!selected.length) {
+        mdui.snackbar({ message: '请至少勾选一个任务' });
+        return;
+      }
       btn.loading = true;
       try {
-        const r = await fetch('/api/tasks/import', { method: 'POST' }).then((x) => x.json());
+        const r = await fetch('/api/tasks/import', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ exponents: selected }),
+        }).then((x) => x.json());
+        $('#importDialog').open = false;
         const tip = $('#taskTip');
         if (r && r.ok) {
           tip.classList.remove('hidden');
-          tip.innerHTML =
-            `导入完成：新增 ${(r.added || []).length} 个任务` +
-            ((r.skipped || []).length
-              ? `，跳过 ${r.skipped.length} 个：${r.skipped.map((s) => `M${s.exponent}（${esc(s.reason)}）`).join('、')}`
-              : '');
-          if (window.mdui) mdui.snackbar({ message: `已从 PrimeNet 导入 ${(r.added || []).length} 个任务` });
+          tip.innerHTML = `导入完成：新增 ${(r.added || []).length} 个任务`;
+          if (window.mdui) mdui.snackbar({ message: `已导入 ${(r.added || []).length} 个任务` });
         } else {
           tip.classList.remove('hidden');
           tip.innerHTML = `导入失败：${esc((r && r.error) || '未知错误')}`;
@@ -983,41 +1313,59 @@
       const v = $('#mainTabs').value;
       if (v === 'tasks' && !tasksLoaded) loadTasks();
       if ((v === 'account' || v === 'history') && !mersenneLoaded) loadMersenne(false);
+      // 打开日志页时自动滚动到底部（面板刚显示时滚动才有布局）
+      if (v === 'prpll-log' && $('#prpllAutoScroll').checked) {
+        const pre = $('#prpllLog');
+        pre.scrollTop = pre.scrollHeight;
+      }
+      if (v === 'apn-log' && $('#apnAutoScroll').checked) {
+        const pre = $('#apnLog');
+        pre.scrollTop = pre.scrollHeight;
+      }
     });
   }
 
   // ---------------------------------------------------------------- 日志（SSE）
   function connectLogStream(cfg) {
-    const { kind, select, filterEl, autoEl, preEl, statusEl, btnCopy, btnClear, buildUrl } = cfg;
+    const { select, filterEl, levelEl, autoEl, preEl, statusEl, btnCopy, btnClear, dlBtn, buildUrl } = cfg;
     let source = null;
     let timer = null;
-    let lastText = '';
     let live = false;
     let currentName = '';
-
-    const render = (lines) => {
-      const keyword = filterEl.value.trim();
-      let re = null;
-      if (keyword) {
-        try {
-          re = new RegExp(keyword, 'i');
-        } catch (e) {
-          re = null;
-        }
-      }
-      const visible = re ? lines.filter((l) => re.test(l.text)) : lines;
-      const html = visible.map((l) => `<span class="log-line ${l.level}">${esc(l.text)}</span>`).join('\n');
-      if (html) preEl.innerHTML = html;
-      else preEl.innerHTML = '<span class="log-line info">（无匹配行）</span>';
-      lastText = lines.map((l) => l.text).join('\n');
-      const total = lines.length;
-      updateStatus(visible.length === total ? `共 ${total} 行` : `显示 ${visible.length} / ${total} 行`);
-      if (autoEl.checked) preEl.scrollTop = preEl.scrollHeight;
-    };
+    let snapshot = [];   // 完整快照行 [{level, text}]，用于过滤/高亮/复制/下载
+    let curLevel = 'ALL';
+    let lastText = '';
 
     const updateStatus = (msg) => {
       statusEl.className = 'log-status ' + (live ? 'live' : 'dead');
       statusEl.innerHTML = `<span><span class="dot"></span>${live ? '实时推送中' : '已断开，重连中…'} · ${esc(msg || '')}</span><span>${esc(currentName)}</span>`;
+    };
+
+    const render = () => {
+      const keyword = filterEl.value.trim();
+      const hl = keyword ? new RegExp(escapeRegExp(keyword), 'gi') : null;
+      const visible = snapshot.filter((l) => curLevel === 'ALL' || l.level === curLevel);
+      const html = visible
+        .map((l) => {
+          let text = esc(l.text);
+          if (hl) {
+            const replaced = text.replace(hl, (m) => `<mark>${m}</mark>`);
+            if (replaced !== text) text = replaced;
+          }
+          return `<span class="log-line ${l.level}">${text}</span>`;
+        })
+        .join('\n');
+      preEl.innerHTML = html || '<span class="log-line info">（无匹配行）</span>';
+      lastText = snapshot.map((l) => l.text).join('\n');
+      updateStatus(visible.length === snapshot.length ? `共 ${snapshot.length} 行` : `显示 ${visible.length} / ${snapshot.length} 行`);
+      if (autoEl.checked) preEl.scrollTop = preEl.scrollHeight;
+    };
+
+    const appendPlain = (lines) => {
+      const frag = lines.map((l) => `<span class="log-line ${l.level}">${esc(l.text)}</span>`).join('\n');
+      preEl.insertAdjacentHTML('beforeend', '\n' + frag);
+      preEl.scrollTop = preEl.scrollHeight;
+      updateStatus(`共 ${snapshot.length} 行`);
     };
 
     const connect = (name) => {
@@ -1033,47 +1381,32 @@
       };
       source.addEventListener('snapshot', (e) => {
         const data = JSON.parse(e.data);
-        if (data && data.lines) render(data.lines);
+        if (data && data.lines) {
+          snapshot = data.lines;
+          render();
+        }
         live = true;
       });
       source.addEventListener('lines', (e) => {
         const data = JSON.parse(e.data);
         if (data && data.lines && data.lines.length) {
-          const extra = data.lines.map((l) => ({ level: l.level, text: l.text }));
-          if (autoEl.checked && !filterEl.value.trim()) {
-            // 直接追加，性能更好
-            const frag = extra.map((l) => `<span class="log-line ${l.level}">${esc(l.text)}</span>`).join('\n');
-            preEl.insertAdjacentHTML('beforeend', '\n' + frag);
-            preEl.scrollTop = preEl.scrollHeight;
-            lastText += '\n' + extra.map((l) => l.text).join('\n');
-            updateStatus(`共 ${preEl.querySelectorAll('.log-line').length} 行`);
-          } else {
-            // 有过滤时重建
-            const all = parseCurrent(preEl);
-            all.push(...extra);
-            render(all);
-          }
+          snapshot = snapshot.concat(data.lines).slice(-MAX_SNAPSHOT);
+          const plain = autoEl.checked && !filterEl.value.trim() && curLevel === 'ALL';
+          if (plain) appendPlain(data.lines);
+          else render();
         }
       });
       source.addEventListener('rotated', () => {
+        snapshot = [];
         lastText = '';
+        updateStatus('日志已轮转，重新加载…');
       });
-      source.addEventListener('error', (e) => {
+      source.addEventListener('error', () => {
         live = false;
         updateStatus('连接中断');
         // EventSource 自动重连（retry: 3000）
       });
-      source.onerror = () => {
-        live = false;
-        updateStatus('连接中断');
-      };
     };
-
-    const parseCurrent = (pre) =>
-      Array.from(pre.querySelectorAll('.log-line')).map((el) => ({
-        level: el.className.replace('log-line ', ''),
-        text: el.textContent,
-      }));
 
     // 选择器变化
     if (select) {
@@ -1082,20 +1415,46 @@
       });
     }
 
-    filterEl.addEventListener('input', () => {
-      if (filterEl.value.trim()) {
-        render(parseCurrent(preEl));
-      } else {
-        render(parseCurrent(preEl));
-      }
-    });
+    filterEl.addEventListener('input', render);
+
+    // 级别筛选
+    if (levelEl) {
+      levelEl.addEventListener('click', (e) => {
+        const chip = e.target.closest('.type-chip');
+        if (!chip) return;
+        levelEl.querySelectorAll('.type-chip').forEach((c) => c.classList.remove('active'));
+        chip.classList.add('active');
+        curLevel = chip.dataset.level;
+        render();
+      });
+    }
 
     btnCopy.addEventListener('click', () => {
+      if (!lastText) {
+        mdui.snackbar({ message: '暂无日志内容' });
+        return;
+      }
       navigator.clipboard.writeText(lastText).then(
         () => mdui.snackbar({ message: '日志已复制到剪贴板' }),
         () => mdui.snackbar({ message: '复制失败' })
       );
     });
+
+    // 下载日志
+    if (dlBtn) {
+      dlBtn.addEventListener('click', () => {
+        if (!lastText) {
+          mdui.snackbar({ message: '暂无日志内容' });
+          return;
+        }
+        const blob = new Blob([lastText], { type: 'text/plain;charset=utf-8' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = (currentName || 'log').replace(/[\\/:*?"<>|]/g, '_') + '.txt';
+        a.click();
+        URL.revokeObjectURL(a.href);
+      });
+    }
 
     btnClear.addEventListener('click', () => {
       preEl.innerHTML = '';
@@ -1125,27 +1484,196 @@
 
   function initLogs() {
     connectLogStream({
-      kind: 'prpll',
       select: $('#prpllLogSelect'),
       filterEl: $('#prpllFilter'),
+      levelEl: $('#prpllLevels'),
       autoEl: $('#prpllAutoScroll'),
       preEl: $('#prpllLog'),
       statusEl: $('#prpllLogStatus'),
       btnCopy: $('#prpllCopyBtn'),
       btnClear: $('#prpllClearBtn'),
+      dlBtn: $('#prpllDlBtn'),
       buildUrl: (name) => `/api/log-stream/${name || 'gpuowl-0.log'}?lines=${LOG_LINES}`,
     });
 
     connectLogStream({
-      kind: 'apn',
       select: null,
       filterEl: $('#apnFilter'),
+      levelEl: $('#apnLevels'),
       autoEl: $('#apnAutoScroll'),
       preEl: $('#apnLog'),
       statusEl: $('#apnLogStatus'),
       btnCopy: $('#apnCopyBtn'),
       btnClear: $('#apnClearBtn'),
+      dlBtn: $('#apnDlBtn'),
       buildUrl: () => `/api/log-stream/autoprimenet.log?lines=${LOG_LINES}`,
+    });
+  }
+
+  // ---------------------------------------------------------------- 图表时间范围 + 悬浮提示
+  /** 图表时间范围切换（两个卡片共用，同步高亮） */
+  function initChartRange() {
+    const sync = () => {
+      document.querySelectorAll('.chart-range').forEach((g) => {
+        g.querySelectorAll('.type-chip').forEach((c) => {
+          c.classList.toggle('active', c.dataset.range === chartRange);
+        });
+      });
+    };
+    document.querySelectorAll('.chart-range').forEach((g) => {
+      g.addEventListener('click', (e) => {
+        const chip = e.target.closest('.type-chip');
+        if (!chip) return;
+        chartRange = chip.dataset.range;
+        sync();
+        if (statusData) drawCharts(statusData.prpll);
+      });
+    });
+    sync();
+  }
+
+  /** 被截断（省略号）的元素悬浮时用 title 显示完整内容 */
+  function initTooltip() {
+    document.addEventListener('mouseover', (e) => {
+      const target = e.target.closest(
+        '.truncate, .residue, .data-table td, .sub-row .main .t1, .sub-row .main .t2, .app-title, .worker-note, .file-row .t1, .exp-link'
+      );
+      if (!target || target.dataset.tooltipSet) return;
+      // 内容变化（innerHTML 重建）时旧元素会被替换，这里只对当前元素检查一次
+      target.dataset.tooltipSet = '1';
+      if (target.scrollWidth > target.clientWidth + 1 && !target.getAttribute('title')) {
+        target.setAttribute('title', (target.textContent || '').trim());
+      }
+    });
+  }
+
+  // ---------------------------------------------------------------- 领取任务类型（WorkPreference）
+  async function initWorkPref() {
+    const select = $('#apnWorkPref');
+    const saveBtn = $('#apnWorkPrefSave');
+    const load = async () => {
+      try {
+        const r = await fetch('/api/settings/workpreference', { cache: 'no-store' }).then((x) => x.json());
+        if (r && r.ok && r.options) {
+          select.innerHTML = Object.entries(r.options)
+            .map(([v, label]) => `<mdui-menu-item value="${v}">${esc(label)}</mdui-menu-item>`)
+            .join('');
+          select.value = r.value != null ? String(r.value) : '';
+        }
+      } catch (e) {
+        // 静默失败，等待下次刷新重试
+      }
+    };
+    saveBtn.addEventListener('click', async () => {
+      const value = select.value;
+      if (!value) {
+        mdui.snackbar({ message: '请先选择任务类型' });
+        return;
+      }
+      saveBtn.loading = true;
+      try {
+        const r = await fetch('/api/settings/workpreference', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ value: parseInt(value, 10) }),
+        }).then((x) => x.json());
+        if (r && r.ok) {
+          mdui.snackbar({ message: `任务类型已设为：${r.label}（AutoPrimeNet 下次轮询生效）` });
+          loadStatus(true);
+        } else {
+          mdui.snackbar({ message: (r && r.error) || '保存失败' });
+        }
+      } catch (e) {
+        mdui.snackbar({ message: '保存失败：' + e.message });
+      } finally {
+        saveBtn.loading = false;
+      }
+    });
+    await load();
+  }
+
+  // ---------------------------------------------------------------- 梅森素数发现弹窗
+  const PRIME_SUBS = [
+    '全宇宙第二大的秘密（第一大的还没测出来）。',
+    '这比连中两次彩票头奖还难，但你的显卡真的撞上了。',
+    'GIMPS 总部十二台服务器同时开了一瓶香槟。',
+    '人类两百年的数学家，在你的 GPU 面前集体起立鼓掌。',
+    '这一刻，欧拉、梅森、卢卡斯在数学天国同步起立。',
+    '你的电费账单，终于有了一个划时代的意义。',
+    '在寻找素数的无聊日子里，你亲眼见证了一个奇迹。',
+    '建议立刻截图，这辈子的谈资有了。',
+    '宇宙在 0.0001 秒内对你比了个大拇指。',
+    '别的矿机挖币，你的显卡挖的是真理。',
+  ];
+  const PRIME_NOTES = [
+    '注意：请勿让显卡过度兴奋，以免蓝屏。',
+    '记得向 PrimeNet 提交结果，学分不能白刷。',
+    '如果此刻你在吃饭，这顿饭将载入史册。',
+    '请保持冷静，素数不会因为你的尖叫而改变。',
+    '友情提示：别把显示器搬下楼，邻居会报警的。',
+    '这是你的机器第 1 次（也可能是唯一 1 次）这么荣耀。',
+    '本弹窗没有关闭按钮，因为历史没有后退键。',
+    '你现在被 2147483647 个质数同时注视着。',
+    '建议立刻把屏幕亮度调高，配得上这一刻。',
+  ];
+
+  function triggerPrimeOverlay(exp) {
+    const digits = Math.floor(exp * Math.log10(2)) + 1;
+    $('#primeExp').textContent = `M${fmtNumCompact(exp)}`;
+    $('#primeFact').textContent = `M${fmtNum(exp)} = 2^${fmtNum(exp)} − 1，共 ${fmtNum(digits)} 位十进制数字，写满能绕操场一圈。`;
+    $('#primeSub').textContent = pick(PRIME_SUBS);
+    $('#primeNote').textContent = pick(PRIME_NOTES);
+    $('#primeOverlay').classList.remove('hidden');
+  }
+
+  function initPrimeOverlay() {
+    $('#primeDismiss').addEventListener('click', () => $('#primeOverlay').classList.add('hidden'));
+    $('#primeOverlay').addEventListener('click', (e) => {
+      if (e.target === e.currentTarget) $('#primeOverlay').classList.add('hidden');
+    });
+  }
+
+  // ---------------------------------------------------------------- 移动端侧滑导航
+  function initDrawer() {
+    const drawer = $('#navDrawer');
+    const scrim = $('#drawerScrim');
+    const btn = $('#drawerBtn');
+    const tabs = $('#mainTabs');
+    if (!drawer || !scrim || !btn || !tabs) return;
+
+    const open = () => {
+      drawer.classList.add('open');
+      scrim.classList.add('show');
+      drawer.setAttribute('aria-hidden', 'false');
+    };
+    const close = () => {
+      drawer.classList.remove('open');
+      scrim.classList.remove('show');
+      drawer.setAttribute('aria-hidden', 'true');
+    };
+
+    btn.addEventListener('click', open);
+    scrim.addEventListener('click', close);
+
+    drawer.querySelectorAll('.nav-item').forEach((item) => {
+      item.addEventListener('click', () => {
+        tabs.value = item.dataset.tab;
+        close();
+      });
+    });
+
+    const syncActive = () => {
+      const v = tabs.value;
+      drawer.querySelectorAll('.nav-item').forEach((item) => {
+        item.classList.toggle('active', item.dataset.tab === v);
+      });
+    };
+    tabs.addEventListener('change', syncActive);
+    syncActive();
+
+    // 窗口拉宽到桌面尺寸时自动收起
+    window.addEventListener('resize', () => {
+      if (window.innerWidth > 640) close();
     });
   }
 
@@ -1156,6 +1684,11 @@
     initLogs();
     initMersenne();
     initTasks();
+    initChartRange();
+    initTooltip();
+    initWorkPref();
+    initPrimeOverlay();
+    initDrawer();
     loadStatus();
     setInterval(() => loadStatus(false), POLL_MS);
 

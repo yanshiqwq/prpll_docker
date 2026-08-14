@@ -264,4 +264,12 @@ function getLastError() {
   return cache.lastError;
 }
 
-module.exports = { setUsername, getMersenne, getLastError, unreserveByAid, fetchPublicText };
+/** 清除抓取缓存（取消/导入分配后调用，让下次读取立即反映最新状态） */
+function clearCache() {
+  cache.data = null;
+  cache.fetchedAt = 0;
+  cache.lastError = null;
+  cache.inflight = null;
+}
+
+module.exports = { setUsername, getMersenne, getLastError, unreserveByAid, fetchPublicText, clearCache };

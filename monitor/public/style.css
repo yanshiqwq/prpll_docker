@@ -36,6 +36,9 @@ body {
   position: sticky;
   top: 0;
   z-index: 50;
+  display: flex;
+  align-items: center; /* 标题/徽标/时钟垂直居中 */
+  border-bottom: 1px solid rgb(var(--mdui-color-outline-variant));
 }
 
 .brand-icon {
@@ -140,6 +143,8 @@ body {
   justify-content: space-between;
   gap: 12px;
   margin-bottom: 14px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid rgb(var(--mdui-color-outline-variant));
 }
 
 .card-title-row {
@@ -285,6 +290,11 @@ body {
   gap: 2px 20px;
 }
 
+/* PRPLL / AutoPrimeNet 的信息块最多两栏 */
+.kv-list--2 {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
 .kv {
   padding: 5px 0;
   border-bottom: 1px dashed rgb(var(--mdui-color-outline-variant));
@@ -374,6 +384,40 @@ body {
   font-size: 0.78rem;
   color: rgb(var(--mdui-color-on-surface-variant));
   flex: none;
+}
+
+/* ================= 数据与磁盘 ================= */
+.file-row .file-icon {
+  flex: none;
+  font-size: 22px;
+  color: rgb(var(--mdui-color-on-surface-variant));
+}
+
+.file-row .file-icon.dir {
+  color: rgb(var(--mdui-color-tertiary));
+}
+
+.file-row .main .t1.mono {
+  font-family: 'JetBrains Mono', 'Cascadia Code', Consolas, monospace;
+  font-size: 0.82rem;
+}
+
+.file-row.missing .t1 {
+  color: rgb(var(--mdui-color-error));
+  text-decoration: line-through;
+}
+
+/* ================= 领取任务类型（AutoPrimeNet 卡） ================= */
+.apn-workpref {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.apn-workpref-select {
+  flex: 1;
+  max-width: 320px;
 }
 
 .assign-row .main {
@@ -630,6 +674,24 @@ body {
   border-top: 4px solid rgb(var(--mdui-color-error));
 }
 
+/* ================= 取消对话框：任务进度/状态 ================= */
+.dialog-status {
+  margin: 10px 0;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: rgb(var(--mdui-color-surface-container));
+  border: 1px solid rgb(var(--mdui-color-outline-variant));
+}
+
+.dialog-bar {
+  margin: 0 0 6px;
+}
+
+.kv .v.ok-text {
+  color: rgb(var(--mdui-color-secondary));
+  font-weight: 600;
+}
+
 /* ================= 日志页 ================= */
 .page-log {
   max-width: 1400px;
@@ -664,7 +726,7 @@ body {
 }
 
 .log-filter {
-  width: 240px;
+  width: 300px;
 }
 
 .auto-label {
@@ -690,9 +752,22 @@ body {
   background: rgb(var(--mdui-color-surface-container));
   font-family: 'JetBrains Mono', 'Cascadia Code', Consolas, 'Courier New', monospace;
   font-size: 0.78rem;
-  line-height: 1.55;
+  line-height: 1.3;
   white-space: pre-wrap;
   word-break: break-all;
+}
+
+/* 日志关键词高亮 */
+.log-view mark {
+  background: rgb(var(--mdui-color-tertiary-container));
+  color: rgb(var(--mdui-color-on-tertiary-container));
+  border-radius: 3px;
+  padding: 0 2px;
+}
+
+/* 日志级别筛选 chips */
+.log-levels {
+  flex-wrap: wrap;
 }
 
 .log-status {
@@ -758,6 +833,361 @@ body {
   color: rgb(var(--mdui-color-on-surface));
 }
 
+/* ================= 截断省略 + 悬浮提示 ================= */
+.truncate {
+  max-width: 100%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 截断的 AID：可悬浮查看完整值 */
+.aid {
+  cursor: help;
+  border-bottom: 1px dotted var(--mdui-color-outline);
+}
+
+/* ================= 图表时间范围 ================= */
+.chart-range {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+/* ================= 历史任务：本机高亮 ================= */
+.legend-local {
+  font-size: 0.74rem;
+  color: rgb(var(--mdui-color-on-surface-variant));
+  white-space: nowrap;
+}
+
+.tag-local {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 0.68rem;
+  font-weight: 600;
+  background: rgb(var(--mdui-color-secondary-container));
+  color: rgb(var(--mdui-color-on-secondary-container));
+  vertical-align: middle;
+}
+
+.data-table tbody tr.row-local {
+  background: rgb(var(--mdui-color-secondary-container));
+}
+
+.data-table tbody tr.row-local:hover {
+  background: rgb(var(--mdui-color-secondary-container));
+  filter: brightness(1.06);
+}
+
+/* ================= 导入任务多选弹窗 ================= */
+.import-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 8px;
+  flex-wrap: wrap;
+}
+
+.import-list {
+  max-height: 320px;
+  overflow-y: auto;
+  border: 1px solid rgb(var(--mdui-color-outline-variant));
+  border-radius: 10px;
+}
+
+.import-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border-bottom: 1px solid rgb(var(--mdui-color-outline-variant));
+  cursor: pointer;
+  font-size: 0.88rem;
+}
+
+.import-item:last-child {
+  border-bottom: none;
+}
+
+.import-item:hover {
+  background: rgb(var(--mdui-color-surface-container-high));
+}
+
+/* 导入加载态：转圈 + 文字 */
+.import-loading {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 32px 8px;
+}
+
+.import-loading mdui-circular-progress {
+  color: rgb(var(--mdui-color-primary));
+}
+
+.import-exp {
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.import-aid {
+  font-family: 'JetBrains Mono', 'Cascadia Code', Consolas, monospace;
+  font-size: 0.74rem;
+  color: rgb(var(--mdui-color-on-surface-variant));
+}
+
+.import-bits {
+  margin-left: auto;
+  font-size: 0.76rem;
+  color: rgb(var(--mdui-color-on-surface-variant));
+  white-space: nowrap;
+}
+
+/* ================= 梅森素数发现弹窗（全屏） ================= */
+.prime-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: radial-gradient(ellipse at center, #2b1055 0%, #14001f 55%, #000 100%);
+  color: #ffd54f;
+  text-align: center;
+  overflow: hidden;
+  cursor: pointer;
+}
+
+.prime-overlay::before {
+  content: '';
+  position: absolute;
+  inset: -50%;
+  background: conic-gradient(
+    from 0deg,
+    rgba(255, 213, 79, 0.12),
+    rgba(255, 213, 79, 0) 30%,
+    rgba(255, 213, 79, 0.12) 50%,
+    rgba(255, 213, 79, 0) 80%,
+    rgba(255, 213, 79, 0.12)
+  );
+  animation: primeSpin 14s linear infinite;
+}
+
+.prime-inner {
+  position: relative;
+  z-index: 1;
+  animation: primePop 0.6s cubic-bezier(0.2, 1.6, 0.4, 1);
+}
+
+.prime-label {
+  font-size: clamp(20px, 4vw, 48px);
+  font-weight: 800;
+  letter-spacing: 0.3em;
+  color: #ff8a65;
+  margin-bottom: 8px;
+  animation: primeBlink 1.2s ease-in-out infinite;
+}
+
+.prime-exp {
+  font-size: clamp(80px, 22vw, 280px);
+  font-weight: 900;
+  line-height: 1;
+  color: #ffd54f;
+  text-shadow: 0 0 30px rgba(255, 213, 79, 0.8), 0 0 80px rgba(255, 213, 79, 0.4);
+  animation: primePulse 1.6s ease-in-out infinite;
+}
+
+.prime-big {
+  font-size: clamp(40px, 10vw, 120px);
+  font-weight: 900;
+  letter-spacing: 0.12em;
+  color: #fff;
+  text-shadow: 0 0 24px rgba(255, 255, 255, 0.5);
+  margin: 4px 0 12px;
+}
+
+.prime-cn {
+  font-size: clamp(18px, 4vw, 40px);
+  font-weight: 700;
+  color: #b39ddb;
+  margin-bottom: 20px;
+}
+
+.prime-fact {
+  font-size: clamp(14px, 2vw, 22px);
+  color: #ffe082;
+  max-width: 720px;
+  margin: 0 auto 10px;
+}
+
+.prime-sub {
+  font-size: clamp(16px, 3vw, 30px);
+  font-weight: 600;
+  color: #ffcc02;
+  margin-bottom: 8px;
+}
+
+.prime-note {
+  font-size: clamp(13px, 2vw, 18px);
+  color: #b0bec5;
+  font-style: italic;
+  margin-bottom: 28px;
+}
+
+.prime-dismiss {
+  font-size: clamp(14px, 2vw, 20px);
+  padding: 12px 28px;
+  border-radius: 999px;
+  border: 2px solid #ffd54f;
+  background: rgba(255, 213, 79, 0.12);
+  color: #ffd54f;
+  cursor: pointer;
+  transition: all 0.2s;
+  font-weight: 600;
+}
+
+.prime-dismiss:hover {
+  background: #ffd54f;
+  color: #2b1055;
+}
+
+.prime-test-btn {
+  margin-left: 12px;
+}
+
+@keyframes primePulse {
+  0%,
+  100% {
+    transform: scale(1);
+  }
+  50% {
+    transform: scale(1.06);
+  }
+}
+
+@keyframes primeBlink {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+@keyframes primeSpin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes primePop {
+  0% {
+    transform: scale(0.2);
+    opacity: 0;
+  }
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+/* ================= 移动端侧滑导航（窄屏启用，桌面端隐藏） ================= */
+.drawer-btn,
+.nav-drawer,
+.drawer-scrim {
+  display: none;
+}
+
+.nav-drawer {
+  position: fixed;
+  top: 0;
+  left: 0;
+  bottom: 0;
+  width: 280px;
+  max-width: 85vw;
+  z-index: 100;
+  flex-direction: column;
+  background: rgb(var(--mdui-color-surface-container));
+  border-right: 1px solid rgb(var(--mdui-color-outline-variant));
+  box-shadow: var(--mdui-elevation-level4);
+  transform: translateX(-100%);
+  transition: transform 0.28s cubic-bezier(0.32, 0.72, 0, 1);
+  overflow-y: auto;
+}
+
+.nav-drawer.open {
+  transform: translateX(0);
+}
+
+.nav-drawer-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 20px 18px 14px;
+  border-bottom: 1px solid rgb(var(--mdui-color-outline-variant));
+}
+
+.nav-drawer-title {
+  font-size: 1.1rem;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.nav-drawer-list {
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.nav-item {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 12px 14px;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  color: rgb(var(--mdui-color-on-surface-variant));
+  font-size: 0.92rem;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.nav-item:active {
+  background: rgb(var(--mdui-color-surface-container-high));
+}
+
+.nav-item.active {
+  background: rgb(var(--mdui-color-secondary-container));
+  color: rgb(var(--mdui-color-on-secondary-container));
+  font-weight: 600;
+}
+
+.drawer-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 99;
+  background: rgba(0, 0, 0, 0.45);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.28s ease;
+}
+
+.drawer-scrim.show {
+  opacity: 1;
+  pointer-events: auto;
+}
+
 /* 移动端适配 */
 @media (max-width: 640px) {
   .page {
@@ -766,6 +1196,10 @@ body {
 
   .grid,
   .grid-charts {
+    grid-template-columns: 1fr;
+  }
+
+  .kv-list--2 {
     grid-template-columns: 1fr;
   }
 
@@ -783,5 +1217,43 @@ body {
 
   .log-filter {
     width: 100%;
+  }
+
+  /* 移动端：顶栏页签改到侧滑栏（只隐藏标签栏，保留 tab-panel 内容渲染） */
+  .main-tabs > mdui-tab {
+    display: none;
+  }
+
+  .drawer-btn {
+    display: inline-flex;
+  }
+
+  #menuBtn {
+    display: none;
+  }
+
+  .nav-drawer {
+    display: flex;
+  }
+
+  .drawer-scrim {
+    display: block;
+  }
+
+  /* 图表时间范围：移动端排成副标题下方一整行横排（五个均分） */
+  .panel-card .card-head:has(.chart-range) {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .panel-card .card-head:has(.chart-range) .chart-range {
+    width: 100%;
+    justify-content: space-between;
+  }
+
+  .panel-card .card-head:has(.chart-range) .type-chip {
+    flex: 1;
+    text-align: center;
+    padding: 5px 4px;
   }
 }

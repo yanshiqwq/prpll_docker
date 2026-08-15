@@ -17,6 +17,7 @@ const fs = require('fs');
 const path = require('path');
 const mersenne = require('./mersenne');
 const tasks = require('./tasks');
+const { createHistoryDB } = require('./db');
 
 const ROOT = __dirname;
 const PUBLIC_DIR = path.join(ROOT, 'public');
@@ -24,6 +25,12 @@ const VENDOR_DIR = path.join(ROOT, 'vendor');
 const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(ROOT, '..', 'data'));
 const PORT = parseInt(process.env.PORT || '8080', 10);
 const HOST = process.env.HOST || '0.0.0.0';
+const HISTORY_DB_PATH = path.join(DATA_DIR, 'monitor.sqlite');
+
+// 历史数据持久化（SQLite，Node 24 内置 node:sqlite）
+// 初始化失败直接抛出错误，让进程以非零退出码退出（不静默回退）
+const historyDb = createHistoryDB(HISTORY_DB_PATH, DATA_DIR);
+console.log(`[monitor] 历史数据库已就绪: ${HISTORY_DB_PATH}`);
 
 const LOG_NAME_RE = /^(gpuowl-\d+\.log|autoprimenet\.log)$/;
 const MAX_TAIL_BYTES = 8 * 1024 * 1024; // 最多读取 8MB 尾部用于解析
@@ -143,6 +150,10 @@ function sample(points, n) {
 
 const GPUOWL_PROGRESS_RE =
   /^(\d{8}) (\d{2}:\d{2}:\d{2}) +(\d+) +(?:OK +)?(\d+) +([0-9a-f]{16}) +(\d+)(?: +ETA [^;]+)?/;
+
+// CERT 进度行：<ts> <exp>  <iter> / <total> <res> <us> ETA
+const GPUOWL_CERT_PROGRESS_RE =
+  /^(\d{8}) (\d{2}:\d{2}:\d{2}) +(\d+) +(\d+) +\/ +(\d+) +([0-9a-f]{16}) +(\d+)(?: +ETA [^;]+)?/;
 
 /** 按文件 stat 做缓存的工具：文件未变化时复用解析结果 */
 const fileCache = new Map();
@@ -296,10 +307,44 @@ function parseGpuowlLog(name) {
       };
       if (isOk) lastOk = lastProgress;
 
-      // 历史点（按当前指数）
+      // 历史点（按当前指数），三元组 [ts, value, exponent] 便于按任务分段上色
       if (currentExponent) {
-        progressHistory.push([ts, (iteration / exp) * 100]);
-        if (us > 0) speedHistory.push([ts, 1e6 / us]);
+        progressHistory.push([ts, (iteration / exp) * 100, exp]);
+        if (us > 0) speedHistory.push([ts, 1e6 / us, exp]);
+      }
+      continue;
+    }
+
+    const cp = GPUOWL_CERT_PROGRESS_RE.exec(line);
+    if (cp) {
+      const exp = parseInt(cp[3], 10);
+      const iteration = parseInt(cp[4], 10);
+      const total = parseInt(cp[5], 10);
+      const us = parseInt(cp[7], 10);
+      const etaM = /ETA ([^;]+)/.exec(line);
+
+      if (exp !== currentExponent) {
+        currentExponent = exp;
+        // 换任务后 FFT 等信息可能变化，保留但以最新为准
+      }
+
+      lastProgress = {
+        ts,
+        exponent: exp,
+        iteration,
+        total,
+        usPerIter: us,
+        ok: false,
+        etaSec: etaM ? parseEta(etaM[1]) : null,
+        etaText: etaM ? etaM[1].trim() : null,
+        z: null,
+        avg: null,
+      };
+
+      // 历史点（按当前指数），CERT 以 squarings 总数计算百分比
+      if (currentExponent) {
+        progressHistory.push([ts, total > 0 ? (iteration / total) * 100 : 0, exp]);
+        if (us > 0) speedHistory.push([ts, 1e6 / us, exp]);
       }
       continue;
     }
@@ -317,11 +362,13 @@ function parseGpuowlLog(name) {
   let exponent = lastProgress ? lastProgress.exponent : null;
   let iteration = lastProgress ? lastProgress.iteration : null;
   let usPerIter = lastProgress ? lastProgress.usPerIter : null;
-  const percent = exponent && iteration != null ? (iteration / exponent) * 100 : null;
+  const total = lastProgress ? lastProgress.total : null;
+  const progressTotal = total || exponent;
+  const percent = iteration != null && progressTotal ? (iteration / progressTotal) * 100 : null;
   const itersPerSec = usPerIter ? 1e6 / usPerIter : null;
   const percentPerDay =
-    usPerIter && exponent ? ((86400e6 / usPerIter) / exponent) * 100 : null;
-  const remaining = exponent && iteration != null ? exponent - iteration : null;
+    usPerIter && progressTotal ? ((86400e6 / usPerIter) / progressTotal) * 100 : null;
+  const remaining = iteration != null && progressTotal ? progressTotal - iteration : null;
   const etaSec = usPerIter && remaining ? (remaining * usPerIter) / 1e6 : lastOk ? lastOk.etaSec : null;
   // 证明文件进度
   let proofCount = null;
@@ -334,11 +381,22 @@ function parseGpuowlLog(name) {
     }
   }
 
-  // 历史（当前指数）：等距采样到 300 点
-  const history = {
-    progress: sample(progressHistory, 300),
-    speed: sample(speedHistory, 300),
-  };
+  // 历史：优先从 SQLite 查询（覆盖日志滚动 / 8MB 窗口之外的历史数据），
+  // 查询不到时回退到当前日志解析的点（等距采样到 300 点）
+  let progress = null;
+  let speed = null;
+  if (historyDb) {
+    try {
+      const workerIdx = worker.worker || 0;
+      progress = historyDb.queryPoints({ worker: workerIdx, limit: 600 }, 'progress');
+      speed = historyDb.queryPoints({ worker: workerIdx, limit: 600 }, 'speed');
+    } catch (e) {
+      console.error('[monitor] 查询历史数据库失败:', e.message);
+    }
+  }
+  if (!progress || !progress.length) progress = sample(progressHistory, 300);
+  if (!speed || !speed.length) speed = sample(speedHistory, 300);
+  const history = { progress, speed };
 
   return {
     ...worker,
@@ -402,6 +460,33 @@ function parsePrpll() {
 
 // ---------------------------------------------------------------- AutoPrimeNet 解析
 
+// 版本号与监控目录只在 AutoPrimeNet 启动时打印一次，尾部扫描窗口之外时
+// 回退到全文件扫描（该信息运行期不变，扫描结果也缓存到内存避免反复读大文件）。
+let apnPersistent = { version: null, watcher: null };
+
+/** 扫描整个日志文件，提取只在启动时打印一次的版本号与监控目录 */
+function scanApnPersistent() {
+  const filePath = path.join(DATA_DIR, 'autoprimenet.log');
+  try {
+    const st = fs.statSync(filePath);
+    if (!st.size) return apnPersistent;
+    // 避免一次性读取超大文件：只读尾部 2MB（版本/目录行在每次启动时都会重新出现）
+    const bytes = Math.min(st.size, 2 * 1024 * 1024);
+    const fd = fs.openSync(filePath, 'r');
+    const buf = Buffer.alloc(bytes);
+    const read = fs.readSync(fd, buf, 0, bytes, st.size - bytes);
+    fs.closeSync(fd);
+    const text = buf.toString('utf8', 0, read);
+    const verM = /AutoPrimeNet assignment handler version ([0-9.]+)/.exec(text);
+    if (verM) apnPersistent.version = verM[1];
+    const watchM = /Watching the directory: '([^']+)'/.exec(text);
+    if (watchM) apnPersistent.watcher = watchM[1];
+  } catch (e) {
+    if (e.code !== 'ENOENT') throw e;
+  }
+  return apnPersistent;
+}
+
 function parseApnInternal() {
   const name = 'autoprimenet.log';
   const data = safeReadLines(path.join(DATA_DIR, name));
@@ -428,7 +513,12 @@ function parseApnInternal() {
     warningCount: 0,
   };
 
-  if (!data) return out;
+  if (!data) {
+    scanApnPersistent();
+    out.version = apnPersistent.version;
+    out.watcher = apnPersistent.watcher;
+    return out;
+  }
   out.logSize = data.size;
   const lines = data.lines;
   const tail = lines.slice(-400);
@@ -443,8 +533,11 @@ function parseApnInternal() {
       out.warnings.push({ ts, level, text: msg });
     }
 
-    const verM = /AutoPrimeNet assignment handler version ([\d.]+)/.exec(msg);
-    if (verM) out.version = verM[1];
+    const verM = /AutoPrimeNet assignment handler version ([\.0-9]+)/.exec(msg);
+    if (verM) {
+      out.version = verM[1];
+      apnPersistent.version = verM[1];
+    }
 
     const gotM = /Got assignment (\w+): (\w+) M(\d+)/.exec(msg);
     if (gotM) {
@@ -484,7 +577,10 @@ function parseApnInternal() {
     }
 
     const watchM = /Watching the directory: '(.+)'/.exec(msg);
-    if (watchM) out.watcher = watchM[1];
+    if (watchM) {
+      out.watcher = watchM[1];
+      apnPersistent.watcher = watchM[1];
+    }
 
     if (/Will report results/.test(msg)) {
       out.lastCheck = tsStr.slice(0, 19);
@@ -513,6 +609,12 @@ function parseApnInternal() {
   out.lastLogAt = hdr ? parseIsoTs(hdr[2]) : data.mtimeMs;
   out.warningCount = out.warnings.length;
   out.warnings = out.warnings.slice(-6);
+  // 版本号与监控目录已滚出尾部窗口时，回退到全文件扫描结果
+  if (out.version == null || out.watcher == null) {
+    scanApnPersistent();
+    if (out.version == null) out.version = apnPersistent.version;
+    if (out.watcher == null) out.watcher = apnPersistent.watcher;
+  }
   return out;
 }
 
@@ -618,11 +720,11 @@ function parseWorktodoFiles() {
     const queue = [];
     const typeLabel = {
       PRP: 'PRP',
-      PRPDC: 'PRP 双重检查',
+      PRPDC: 'PRP 双检',
       CERT: '证书验证',
       PF: '因子分解',
       LL: 'LL',
-      LLDC: 'LL 双重检查',
+      LLDC: 'LL 双检',
     };
     for (const file of files) {
       const data = safeReadLines(path.join(DATA_DIR, file), 1 * 1024 * 1024);
@@ -740,22 +842,79 @@ function parseElapsedMap() {
 
 // ---------------------------------------------------------------- 领取任务类型 / 存储统计
 
-/** 领取任务类型选项（PRPLL 支持的 WorkPreference） */
+/** 领取任务类型选项（参考 AutoPrimeNet 官方 WorkPreference 列表，括号内为任务类型数字 ID，desc 为悬停 tooltip 简介） */
 const WORK_PREFERENCE_OPTIONS = {
-  150: '首次 PRP 测试',
-  151: 'PRP 双重检查',
-  155: 'PRP 双重检查（带证明）',
-  160: '首次 PRP（合数）',
-  161: 'PRP 双重检查（合数）',
+  4: {
+    label: 'P-1 因数分解（4）',
+    desc: '在 LL/PRP 测试前对指数进行 P-1 因数分解，找到因子即可跳过后续更耗时的素性测试。',
+  },
+  5: {
+    label: 'ECM 因数分解（5）',
+    desc: '使用椭圆曲线法（ECM）寻找中等大小的因子，通常用于已做完 P-1 仍无法拆分的指数。',
+  },
+  8: {
+    label: 'ECM 梅森合数（8）',
+    desc: '对已知合数的梅森数的余因子进行 ECM 因数分解，进一步拆分合数。',
+  },
+  12: {
+    label: 'GPU 试除（12）',
+    desc: '使用 GPU 进行试除法（Trial Factoring），快速排除带有小因子的指数。',
+  },
+  101: {
+    label: '双检 LL 测试（101）',
+    desc: '对已完成的 LL 测试进行二次验证（双检），确保首次结果正确。',
+  },
+  106: {
+    label: '双检零位移 LL 测试（106）',
+    desc: '使用零位移计数的双检 LL 测试，用于验证依赖位移计数的早期结果。',
+  },
+  150: {
+    label: '首次 PRP 测试（150）',
+    desc: '对尚未测试过的指数进行首次 PRP 素性测试，AutoPrimeNet 默认选项。',
+  },
+  151: {
+    label: '双检 PRP 测试（151）',
+    desc: '对已完成的 PRP 测试进行二次验证（双检），确保首次结果正确。',
+  },
+  152: {
+    label: '世界纪录 PRP 测试（152）',
+    desc: '针对靠近已知最大梅森素数的指数进行测试，有望冲击新的世界纪录。',
+  },
+  153: {
+    label: '1 亿位 PRP 测试（153）',
+    desc: '测试超过 1 亿位十进制数字的指数，属于 EFF 百万美元大奖级别。',
+  },
+  154: {
+    label: '需 P-1 的最小首次 PRP（154）',
+    desc: '优先领取需要先做 P-1 因数分解的最小可用首次 PRP 任务。',
+  },
+  155: {
+    label: '带证明的 PRP 双检（155）',
+    desc: '生成带可验证证明的 PRP 双检，通常可避免额外的 CERT 校验任务。',
+  },
+  156: {
+    label: '带证明的非零位移 PRP 双检（156）',
+    desc: '使用非零位移计数并生成可验证证明的 PRP 双检。',
+  },
+  160: {
+    label: '首次 PRP（梅森合数）（160）',
+    desc: '对梅森合数的余因子进行首次 PRP 素性测试，以证明其合数性质。',
+  },
+  161: {
+    label: 'PRP 双检（梅森合数）（161）',
+    desc: '对梅森合数的余因子进行 PRP 双检，验证首次测试结果。',
+  },
 };
 
 function getWorkPreference() {
   const prime = parseIni();
   const v = prime && prime.workPreference != null ? prime.workPreference : null;
+  const opt = v != null ? WORK_PREFERENCE_OPTIONS[v] : null;
   return {
     ok: true,
     value: v,
-    label: v != null ? WORK_PREFERENCE_OPTIONS[v] || null : null,
+    label: opt ? opt.label : null,
+    defaultValue: 150,
     options: WORK_PREFERENCE_OPTIONS,
   };
 }
@@ -805,7 +964,7 @@ function setWorkPreference(value) {
   }
   // 使配置文件缓存失效，让前端立即读到新值
   if (fileCache.has('ini')) fileCache.delete('ini');
-  return { ok: true, value: v, label: WORK_PREFERENCE_OPTIONS[v] };
+  return { ok: true, value: v, label: WORK_PREFERENCE_OPTIONS[v].label };
 }
 
 /** 扫描数据目录顶层条目（文件/目录），统计大小与文件数；60s 缓存避免频繁 du */
@@ -862,7 +1021,31 @@ function parseStorage() {
   return out;
 }
 
+/** 增量导入 gpuowl-*.log 的进度行到 SQLite（游标记录已处理偏移） */
+function syncHistoryFromLogs() {
+  if (!historyDb) return;
+  try {
+    const logs = fs
+      .readdirSync(DATA_DIR)
+      .filter((f) => /^gpuowl-(\d+)\.log$/.test(f))
+      .sort();
+    for (const f of logs) {
+      const m = /^gpuowl-(\d+)\.log$/.exec(f);
+      const worker = parseInt(m[1], 10);
+      try {
+        historyDb.importLog(f, worker);
+      } catch (e) {
+        console.error(`[monitor] 导入 ${f} 失败:`, e.message);
+      }
+    }
+  } catch (e) {
+    console.error('[monitor] 扫描日志失败:', e.message);
+  }
+}
+
 function buildStatus() {
+  // 增量导入：把 gpuowl-*.log 新增的进度行写入 SQLite（游标记录偏移，避免重复）
+  syncHistoryFromLogs();
   const prpll = parsePrpll();
   const prime = parseIni();
   const queue = parseWorktodoFiles();
@@ -914,7 +1097,7 @@ function buildStatus() {
 // ---------------------------------------------------------------- 日志 API
 
 function classifyGpuowlLine(line) {
-  if (GPUOWL_PROGRESS_RE.test(line)) {
+  if (GPUOWL_PROGRESS_RE.test(line) || GPUOWL_CERT_PROGRESS_RE.test(line)) {
     if (/ OK /.test(line)) return 'ok';
     return 'progress';
   }
@@ -1271,6 +1454,21 @@ server.listen(PORT, HOST, () => {
   console.log(`[monitor] GIMPS 监控中心已启动`);
   console.log(`[monitor] 数据目录: ${DATA_DIR}`);
   console.log(`[monitor] 访问地址: http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${PORT}`);
+  // 数据库未初始化（首次启动 / 表为空）时，触发一次性的日志全量回溯导入
+  if (historyDb && !historyDb.isInitialized()) {
+    console.log('[monitor] 历史数据库为空，开始全量回溯导入日志数据…');
+    try {
+      const r = historyDb.fullImportAll();
+      console.log(`[monitor] 全量导入完成：${r.files} 个日志文件，共 ${r.points} 个进度点`);
+    } catch (e) {
+      console.error('[monitor] 全量导入失败:', e.message);
+    }
+  } else if (historyDb) {
+    const st = historyDb.stats();
+    if (st && st.count > 0) {
+      console.log(`[monitor] 历史数据库已有数据：${st.count} 个进度点`);
+    }
+  }
 });
 
 process.on('SIGINT', () => {

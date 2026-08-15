@@ -172,10 +172,14 @@ async function fetchResults(u) {
   const toRecord = (row, type) => {
     const dateCell = row.datefound || '';
     const date = /^\d{4}-\d{2}-\d{2}/.exec(dateCell)?.[0] || null;
-    const dateTs =
-      /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(dateCell)
-        ? new Date(dateCell.replace(' ', 'T') + 'Z').toISOString()
-        : null;
+    // 生成可排序时间戳：带完整时间用其时间，仅有日期按当天 00:00:00 处理，
+    // 避免无时间戳记录在排序时被排到最后导致"最近完成"取到旧记录
+    let dateTs = null;
+    const dt = /^(\d{4}-\d{2}-\d{2})(?: (\d{2}):(\d{2}):(\d{2}))?$/.exec(dateCell);
+    if (dt) {
+      const [, d, hh = '00', mm = '00', ss = '00'] = dt;
+      dateTs = new Date(`${d}T${hh}:${mm}:${ss}Z`).toISOString();
+    }
     return {
       type,
       exponent: parseInt(String(row.exponent || '').replace(/\s+/g, ''), 10) || null,

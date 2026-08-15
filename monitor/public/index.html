@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
   <meta name="description" content="PRPLL 与 AutoPrimeNet 实时监控面板">
-  <title>GIMPS 监控中心 · PRPLL / AutoPrimeNet</title>
+  <title>GIMPS 监控中心</title>
   <link rel="stylesheet" href="vendor/mdui/mdui.css">
   <link rel="stylesheet" href="style.css">
   <script src="vendor/mdui/mdui.global.js"></script>
@@ -81,18 +81,21 @@
                 <mdui-icon name="show_chart" class="card-icon"></mdui-icon>
                 <div>
                   <div class="card-title">测试进度</div>
-                  <div class="card-subtitle truncate">当前指数进度百分比（可选时间范围）</div>
+                  <div class="card-subtitle truncate">当前指数进度百分比</div>
                 </div>
               </div>
               <div class="chip-group chart-range">
-                <span class="type-chip" data-range="1h">1小时</span>
-                <span class="type-chip" data-range="6h">6小时</span>
-                <span class="type-chip active" data-range="24h">24小时</span>
+                <span class="type-chip active" data-range="cur">当前任务</span>
+                <span class="type-chip" data-range="3h">3小时</span>
+                <span class="type-chip" data-range="24h">24小时</span>
                 <span class="type-chip" data-range="7d">7天</span>
                 <span class="type-chip" data-range="all">全部</span>
               </div>
             </div>
-            <canvas id="progressChart" class="chart" height="220"></canvas>
+            <div class="chart-wrap">
+              <canvas id="progressChart" class="chart" height="220"></canvas>
+              <div class="chart-tip" id="progressTip"></div>
+            </div>
           </mdui-card>
           <mdui-card variant="elevated" class="panel-card">
             <div class="card-head">
@@ -100,18 +103,21 @@
                 <mdui-icon name="speed" class="card-icon"></mdui-icon>
                 <div>
                   <div class="card-title">计算速度</div>
-                  <div class="card-subtitle truncate">迭代速率（迭代/秒，可选时间范围）</div>
+                  <div class="card-subtitle truncate">迭代速率</div>
                 </div>
               </div>
               <div class="chip-group chart-range">
-                <span class="type-chip" data-range="1h">1小时</span>
-                <span class="type-chip" data-range="6h">6小时</span>
-                <span class="type-chip active" data-range="24h">24小时</span>
+                <span class="type-chip active" data-range="cur">当前任务</span>
+                <span class="type-chip" data-range="3h">3小时</span>
+                <span class="type-chip" data-range="24h">24小时</span>
                 <span class="type-chip" data-range="7d">7天</span>
                 <span class="type-chip" data-range="all">全部</span>
               </div>
             </div>
-            <canvas id="speedChart" class="chart" height="220"></canvas>
+            <div class="chart-wrap">
+              <canvas id="speedChart" class="chart" height="220"></canvas>
+              <div class="chart-tip" id="speedTip"></div>
+            </div>
           </mdui-card>
         </div>
 
@@ -186,10 +192,10 @@
             </div>
             <div class="chip-group log-levels" id="prpllLevels">
               <span class="type-chip active" data-level="ALL">全部</span>
-              <span class="type-chip" data-level="info">信息</span>
               <span class="type-chip" data-level="progress">进度</span>
               <span class="type-chip" data-level="ok">校验</span>
               <span class="type-chip" data-level="result">结果</span>
+              <span class="type-chip" data-level="info">信息</span>
               <span class="type-chip" data-level="warn">警告</span>
               <span class="type-chip" data-level="error">错误</span>
             </div>
@@ -221,9 +227,9 @@
             </div>
             <div class="chip-group log-levels" id="apnLevels">
               <span class="type-chip active" data-level="ALL">全部</span>
-              <span class="type-chip" data-level="info">信息</span>
               <span class="type-chip" data-level="ok">校验</span>
               <span class="type-chip" data-level="result">结果</span>
+              <span class="type-chip" data-level="info">信息</span>
               <span class="type-chip" data-level="warn">警告</span>
               <span class="type-chip" data-level="error">错误</span>
             </div>
@@ -253,7 +259,7 @@
                 <mdui-icon name="account_circle" class="card-icon"></mdui-icon>
                 <div>
                   <div class="card-title">PrimeNet 账户</div>
-                  <div class="card-subtitle">mersenne.org 公开数据（自动缓存 10 分钟）</div>
+                  <div class="card-subtitle">mersenne.org 公开数据</div>
                 </div>
               </div>
               <span id="pnStatus" class="badge">…</span>
@@ -317,7 +323,6 @@
               </div>
             </div>
             <div class="log-toolbar-right">
-              <span class="legend-local">■ 本机完成</span>
               <mdui-button id="histExportBtn" variant="text" icon="download">导出 CSV</mdui-button>
               <span id="histCount" class="auto-label"></span>
             </div>
@@ -348,7 +353,7 @@
         <mdui-card variant="elevated" class="panel-card">
           <div class="log-toolbar">
             <div class="log-toolbar-left">
-              <mdui-button id="taskAddBtn" icon="add" variant="tonal">添加任务</mdui-button>
+              <mdui-button id="taskAddBtn" icon="add" variant="tonal">手动添加任务</mdui-button>
               <mdui-button id="taskImportBtn" icon="download" variant="tonal">导入 PrimeNet 任务</mdui-button>
             </div>
             <div class="log-toolbar-right">
@@ -362,7 +367,7 @@
             <div id="taskPaused"></div>
           </div>
           <div class="task-note">
-            提示：暂停/取消对“正在运行”的任务不会中断本次计算，将在其完成当前指数后生效（PRPLL 已在内存中执行）；
+            提示：暂停/取消对“正在运行”的任务不会中断本次计算，将在其完成当前指数后生效；
             对队列中未运行的任务立即生效。
           </div>
         </mdui-card>
@@ -454,10 +459,10 @@ PRPDC=7FF2E25C21ACE56601BEA8C46C827C15,1,2,89168969,-1,76,0,3,1</pre>
     </div>
   </mdui-dialog>
 
-  <!-- 梅森素数发现弹窗（全屏） -->
+  <!-- 梅森素数发现弹窗（神金版） -->
   <div id="primeOverlay" class="prime-overlay hidden">
     <div class="prime-inner">
-      <div class="prime-label">🚨 跨次元数学事件 🚨</div>
+      <div class="prime-label">🚨 我操，检测到跨次元数学事件！！！ 🚨</div>
       <div class="prime-exp" id="primeExp">M31</div>
       <div class="prime-big">IS&nbsp;PRIME!!!</div>
       <div class="prime-cn">检测到新梅森素数</div>

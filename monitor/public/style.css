@@ -472,6 +472,19 @@ body {
   overflow-y: auto;
 }
 
+/* 领取任务类型下拉：默认选项徽标 */
+.wp-default-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 0.68rem;
+  font-weight: 600;
+  background: rgb(var(--mdui-color-primary-container));
+  color: rgb(var(--mdui-color-on-primary-container));
+  white-space: nowrap;
+}
+
 .warn-row {
   margin-top: 8px;
   padding: 8px 10px;
@@ -497,10 +510,55 @@ body {
 }
 
 /* ================= 图表 ================= */
+.chart-wrap {
+  position: relative;
+}
+
 .chart {
   width: 100%;
   height: 220px;
   display: block;
+}
+
+/* 图表悬停提示 */
+.chart-tip {
+  position: absolute;
+  top: 8px;
+  left: 0;
+  pointer-events: none;
+  display: none;
+  z-index: 10;
+  max-width: 240px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  font-size: 0.76rem;
+  line-height: 1.5;
+  background: rgb(var(--mdui-color-surface-container-high));
+  color: rgb(var(--mdui-color-on-surface));
+  box-shadow: var(--mdui-elevation-level2);
+  border: 1px solid rgb(var(--mdui-color-outline-variant));
+}
+
+.chart-tip .tip-title {
+  font-weight: 600;
+  margin-bottom: 2px;
+}
+
+.chart-tip .tip-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.chart-tip .tip-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+}
+
+.chart-tip .tip-time {
+  color: rgb(var(--mdui-color-on-surface-variant));
 }
 
 /* ================= 历史任务表格 ================= */
@@ -768,6 +826,57 @@ body {
 /* 日志级别筛选 chips */
 .log-levels {
   flex-wrap: wrap;
+}
+
+/* 级别按钮配色：与日志行颜色对应（非激活用浅色背景容器色，激活用实色） */
+.log-levels .type-chip[data-level="ok"] {
+  color: rgb(var(--mdui-color-on-secondary-container));
+  background: rgb(var(--mdui-color-secondary-container));
+}
+.log-levels .type-chip[data-level="result"] {
+  color: rgb(var(--mdui-color-on-primary-container));
+  background: rgb(var(--mdui-color-primary-container));
+}
+.log-levels .type-chip[data-level="warn"] {
+  background: #917b0c;
+  color: #ffe38e;
+}
+.log-levels .type-chip[data-level="error"] {
+  color: rgb(var(--mdui-color-on-error-container));
+  background: rgb(var(--mdui-color-error-container));
+}
+.log-levels .type-chip[data-level="progress"] {
+  color: rgb(var(--mdui-color-on-surface-variant));
+  background: rgb(var(--mdui-color-surface-container-high));
+}
+.log-levels .type-chip[data-level="info"] {
+  color: rgb(var(--mdui-color-on-surface-variant));
+  background: rgb(var(--mdui-color-surface-container-high));
+}
+
+.log-levels .type-chip.active[data-level="ok"] {
+  background: rgb(var(--mdui-color-secondary));
+  color: rgb(var(--mdui-color-on-secondary));
+}
+.log-levels .type-chip.active[data-level="result"] {
+  background: rgb(var(--mdui-color-primary));
+  color: rgb(var(--mdui-color-on-primary));
+}
+.log-levels .type-chip.active[data-level="warn"] {
+  color: #7a5b00;
+  background: #fff3b0;
+}
+.log-levels .type-chip.active[data-level="error"] {
+  background: rgb(var(--mdui-color-error));
+  color: rgb(var(--mdui-color-on-error));
+}
+.log-levels .type-chip.active[data-level="progress"] {
+  background: rgb(var(--mdui-color-on-surface-variant));
+  color: rgb(var(--mdui-color-surface));
+}
+.log-levels .type-chip.active[data-level="info"] {
+  background: rgb(var(--mdui-color-on-surface));
+  color: rgb(var(--mdui-color-surface));
 }
 
 .log-status {

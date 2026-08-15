@@ -22,7 +22,7 @@
   let cancelTarget = null;
   let pauseTarget = null;
   let pendingCancel = null;
-  let chartRange = '24h'; // '1h' | '6h' | '24h' | '7d' | 'all'
+  let chartRange = 'cur'; // 'cur' | '3h' | '24h' | '7d' | 'all'
   let importCandidates = [];
   let seenPrimeExps = new Set(); // 已触发过素数弹窗的指数，避免重复
   const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
@@ -112,11 +112,11 @@
   function workTypeLabel(t) {
     const map = {
       PRP: 'PRP',
-      'PRP-D': 'PRP 复查',
-      PRPDC: 'PRP 复查',
+      'PRP-D': 'PRP 双检',
+      PRPDC: 'PRP 双检',
       LL: 'LL',
-      'LL-D': 'LL 复查',
-      LLDC: 'LL 复查',
+      'LL-D': 'LL 双检',
+      LLDC: 'LL 双检',
       CERT: '证书验证',
       TF: '试除',
       'P-1': 'P-1',
@@ -316,6 +316,7 @@
           ${kvRow('key', '证明文件', w.proofPower != null ? `${fmtNum(w.proofCount || 0)} / ${Math.pow(2, w.proofPower)} 块（2^${w.proofPower}）` : '—')}
           ${kvRow('history', '本次运行', w.sessionSinceSec != null ? fmtDur(w.sessionSinceSec) : '—')}
           ${kvRow('restart_alt', '重启次数', fmtNum(w.startCount || 0))}
+          ${kvRow('info', '版本', esc(w.version || '—'))}
           ${kvRow('memory', '环境', esc(w.device || '—'))}
         </div>`
       );
@@ -496,7 +497,7 @@
 
   // ---------------------------------------------------------------- 图表
   function chartRangeMs() {
-    const map = { '1h': 3600e3, '6h': 6 * 3600e3, '24h': 24 * 3600e3, '7d': 7 * 24 * 3600e3, all: Infinity };
+    const map = { cur: Infinity, '3h': 3 * 3600e3, '24h': 24 * 3600e3, '7d': 7 * 24 * 3600e3, all: Infinity };
     return map[chartRange] != null ? map[chartRange] : Infinity;
   }
 
@@ -510,21 +511,28 @@
     const progress = worker.history ? worker.history.progress : [];
     const speed = worker.history ? worker.history.speed : [];
     const since = Date.now() - chartRangeMs();
-    const progInRange = progress.filter((p) => p[0] >= since);
-    const speedInRange = speed.filter((p) => p[0] >= since);
+    let progInRange = progress.filter((p) => p[0] >= since);
+    let speedInRange = speed.filter((p) => p[0] >= since);
+    // “当前任务”：只显示当前正在运行的指数（不限时间）
+    if (chartRange === 'cur' && worker.exponent != null) {
+      progInRange = progInRange.filter((p) => p[2] === worker.exponent);
+      speedInRange = speedInRange.filter((p) => p[2] === worker.exponent);
+    }
 
-    drawLineChart($('#progressChart'), progInRange, {
+    drawLineChart($('#progressChart'), $('#progressTip'), progInRange, {
       yAuto: true, // 纵轴按数据范围自动缩放（限制在 0~100）
       yMin: 0,
       yMax: 100,
       yFmt: (v) => v.toFixed(0) + '%',
+      valueFmt: (v) => v.toFixed(2) + '%',
       label: worker.exponent ? `M${fmtNumCompact(worker.exponent)}` : '',
       emptyText: '该时间范围暂无数据',
     });
 
-    drawLineChart($('#speedChart'), speedInRange, {
+    drawLineChart($('#speedChart'), $('#speedTip'), speedInRange, {
       yAuto: true, // 纵轴按数据范围自动缩放
       yFmt: (v) => fmtNumCompact(v) + '/s',
+      valueFmt: (v) => fmtNumCompact(v) + ' 迭代/秒',
       label: worker.itersPerSec != null ? `${worker.itersPerSec.toFixed(1)} 迭代/秒` : '',
       emptyText: '该时间范围暂无数据',
       showAvg: true,
@@ -550,15 +558,16 @@
     return v ? `rgb(${v})` : '#888';
   }
 
-  /** MDUI 的 CSS 变量是 "r g b" 空格分隔，转成带透明度的 rgba */
-  function cssVarRgba(name, alpha) {
-    const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
-    const m = /^([\d.]+)\s+([\d.]+)\s+([\d.]+)$/.exec(v);
-    if (m) return `rgba(${m[1]}, ${m[2]}, ${m[3]}, ${alpha})`;
-    return `rgba(30, 136, 229, ${alpha})`;
-  }
+  /** 图表多任务调色板（深浅主题下均清晰） */
+  const CHART_COLORS = ['#1e88e5', '#43a047', '#f4511e', '#8e24aa', '#00897b', '#c0ca33', '#6d4c41', '#3949ab', '#d81b60', '#00acc1'];
 
-  function drawLineChart(canvas, points, opts) {
+  /**
+   * 绘制折线图，支持按任务（指数）分段、不同颜色、悬停提示。
+   * @param {HTMLCanvasElement} canvas
+   * @param {HTMLElement} tipEl 悬停提示容器（.chart-tip）
+   * @param {Array<[number, number, number]>} points 三元组 [ts, value, exponent]
+   */
+  function drawLineChart(canvas, tipEl, points, opts) {
     const ctx = canvas.getContext('2d');
     const dpr = window.devicePixelRatio || 1;
     const w = canvas.clientWidth || canvas.parentElement.clientWidth || 400;
@@ -566,19 +575,35 @@
     canvas.width = w * dpr;
     canvas.height = h * dpr;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.clearRect(0, 0, w, h);
 
     if (!points || points.length < 2) {
+      ctx.clearRect(0, 0, w, h);
       drawEmptyChart(canvas, opts.emptyText || '暂无数据');
+      if (tipEl) tipEl.style.display = 'none';
       return;
     }
 
     const padL = 48;
     const padR = 12;
-    const padT = 14;
+    const padT = 18;
     const padB = 26;
     const iw = w - padL - padR;
     const ih = h - padT - padB;
+
+    // 按指数切分为连续段（同 worker 同一时刻只跑一个指数，故同指数时间上连续）
+    const segments = [];
+    for (const p of points) {
+      const exp = p[2] != null ? p[2] : null;
+      const last = segments[segments.length - 1];
+      if (last && last.exponent === exp) {
+        last.pts.push([p[0], p[1]]);
+      } else {
+        segments.push({ exponent: exp, pts: [[p[0], p[1]]] });
+      }
+    }
+    segments.forEach((s, i) => {
+      s.color = CHART_COLORS[i % CHART_COLORS.length];
+    });
 
     const t0 = points[0][0];
     const t1 = points[points.length - 1][0];
@@ -587,7 +612,6 @@
     const dataMax = Math.max(...vals);
     let yMin, yMax;
     if (opts.yAuto) {
-      // 纵轴按数据范围自动缩放，让趋势可见；可选的 yMin/yMax 作为硬边界
       const pad = Math.max(1, (dataMax - dataMin) * 0.1);
       yMin = Math.max(opts.yMin != null ? opts.yMin : -Infinity, dataMin - pad);
       yMax = Math.min(opts.yMax != null ? opts.yMax : Infinity, dataMax + pad);
@@ -603,83 +627,251 @@
     const x = (t) => padL + ((t - t0) / span) * iw;
     const y = (v) => padT + (1 - (v - yMin) / (yMax - yMin || 1)) * ih;
 
-    // 网格与坐标轴
     const gridColor = cssVar('--mdui-color-outline-variant');
     const textColor = cssVar('--mdui-color-on-surface-variant');
-    ctx.font = '11px sans-serif';
-    ctx.strokeStyle = gridColor;
-    ctx.lineWidth = 1;
-    ctx.fillStyle = textColor;
-    ctx.textAlign = 'right';
-
-    const rows = 4;
-    for (let i = 0; i <= rows; i++) {
-      const v = yMin + ((yMax - yMin) * i) / rows;
-      const yy = y(v);
-      ctx.beginPath();
-      ctx.moveTo(padL, yy);
-      ctx.lineTo(w - padR, yy);
-      ctx.stroke();
-      ctx.fillText(opts.yFmt ? opts.yFmt(v) : v.toFixed(1), padL - 6, yy + 4);
-    }
-
-    const cols = Math.min(6, Math.max(3, Math.floor(iw / 90)));
-    ctx.textAlign = 'center';
-    for (let i = 0; i <= cols; i++) {
-      const t = t0 + (span * i) / cols;
-      const xx = x(t);
-      ctx.beginPath();
-      ctx.moveTo(xx, padT);
-      ctx.lineTo(xx, h - padB);
-      ctx.stroke();
-      ctx.fillText(fmtClock(t), xx, h - 8);
-    }
-
-    // 平均线
-    let avg = null;
-    if (opts.showAvg) {
-      avg = points.reduce((s, p) => s + p[1], 0) / points.length;
-      ctx.strokeStyle = cssVar('--mdui-color-tertiary');
-      ctx.setLineDash([4, 4]);
-      ctx.beginPath();
-      ctx.moveTo(padL, y(avg));
-      ctx.lineTo(w - padR, y(avg));
-      ctx.stroke();
-      ctx.setLineDash([]);
-    }
-
-    // 数据线 + 渐变面积
     const lineColor = cssVar('--mdui-color-primary');
-    ctx.strokeStyle = lineColor;
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    points.forEach((p, i) => (i ? ctx.lineTo(x(p[0]), y(p[1])) : ctx.moveTo(x(p[0]), y(p[1]))));
-    ctx.stroke();
 
-    const grad = ctx.createLinearGradient(0, padT, 0, h - padB);
-    grad.addColorStop(0, cssVarRgba('--mdui-color-primary', 0.18));
-    grad.addColorStop(1, cssVarRgba('--mdui-color-primary', 0));
-    ctx.fillStyle = grad;
-    ctx.beginPath();
-    ctx.moveTo(x(points[0][0]), h - padB);
-    points.forEach((p) => ctx.lineTo(x(p[0]), y(p[1])));
-    ctx.lineTo(x(points[points.length - 1][0]), h - padB);
-    ctx.closePath();
-    ctx.fill();
+    // 平均线：按任务（segment）分别计算，每个任务在自身时间范围内绘制
+    if (opts.showAvg) {
+      for (const seg of segments) {
+        if (seg.pts.length < 2) continue;
+        let sum = 0;
+        let cnt = 0;
+        for (const p of seg.pts) {
+          if (p[1] != null) { sum += p[1]; cnt++; }
+        }
+        seg.avg = cnt ? sum / cnt : null;
+      }
+    }
 
-    // 末点标注
-    const last = points[points.length - 1];
-    ctx.fillStyle = lineColor;
-    ctx.beginPath();
-    ctx.arc(x(last[0]), y(last[1]), 3.5, 0, Math.PI * 2);
-    ctx.fill();
+    /** 核心渲染；hoverX 为鼠标所在像素 x（可为 null） */
+    function render(hoverX) {
+      ctx.clearRect(0, 0, w, h);
 
-    if (opts.label) {
+      // 网格与坐标轴
+      ctx.font = '11px sans-serif';
+      ctx.strokeStyle = gridColor;
+      ctx.lineWidth = 1;
       ctx.fillStyle = textColor;
+      ctx.textAlign = 'right';
+      const rows = 4;
+      for (let i = 0; i <= rows; i++) {
+        const v = yMin + ((yMax - yMin) * i) / rows;
+        const yy = y(v);
+        ctx.beginPath();
+        ctx.moveTo(padL, yy);
+        ctx.lineTo(w - padR, yy);
+        ctx.stroke();
+        ctx.fillText(opts.yFmt ? opts.yFmt(v) : v.toFixed(1), padL - 6, yy + 4);
+      }
+
+      const cols = Math.min(6, Math.max(3, Math.floor(iw / 90)));
+      ctx.textAlign = 'center';
+      for (let i = 0; i <= cols; i++) {
+        const t = t0 + (span * i) / cols;
+        const xx = x(t);
+        ctx.beginPath();
+        ctx.moveTo(xx, padT);
+        ctx.lineTo(xx, h - padB);
+        ctx.stroke();
+        ctx.fillText(fmtClock(t), xx, h - 8);
+      }
+
+      // 平均线：每个任务一条，统一用 tertiary 颜色（对比度更高），只在该任务时间范围内绘制
+      const avgColor = cssVar('--mdui-color-tertiary');
+      for (const seg of segments) {
+        if (seg.avg == null || seg.pts.length < 2) continue;
+        const x0 = x(seg.pts[0][0]);
+        const x1 = x(seg.pts[seg.pts.length - 1][0]);
+        const ya = y(seg.avg);
+        ctx.strokeStyle = avgColor;
+        ctx.lineWidth = 1.5;
+        ctx.setLineDash([5, 4]);
+        ctx.beginPath();
+        ctx.moveTo(x0, ya);
+        ctx.lineTo(x1, ya);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+
+      // 各任务段：数据线 + 渐变面积 + 末点
+      segments.forEach((seg) => {
+        if (seg.pts.length < 1) return;
+        const c = seg.color;
+        // 渐变面积（单段时保留，多段时也叠加半透明便于区分任务区间）
+        if (seg.pts.length > 1) {
+          const grad = ctx.createLinearGradient(0, padT, 0, h - padB);
+          grad.addColorStop(0, hexToRgba(c, 0.16));
+          grad.addColorStop(1, hexToRgba(c, 0));
+          ctx.fillStyle = grad;
+          ctx.beginPath();
+          ctx.moveTo(x(seg.pts[0][0]), h - padB);
+          seg.pts.forEach((p) => ctx.lineTo(x(p[0]), y(p[1])));
+          ctx.lineTo(x(seg.pts[seg.pts.length - 1][0]), h - padB);
+          ctx.closePath();
+          ctx.fill();
+        }
+        // 数据线
+        ctx.strokeStyle = c;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        seg.pts.forEach((p, i) => (i ? ctx.lineTo(x(p[0]), y(p[1])) : ctx.moveTo(x(p[0]), y(p[1]))));
+        ctx.stroke();
+        // 末点
+        const last = seg.pts[seg.pts.length - 1];
+        ctx.fillStyle = c;
+        ctx.beginPath();
+        ctx.arc(x(last[0]), y(last[1]), 3.5, 0, Math.PI * 2);
+        ctx.fill();
+      });
+
+      // 悬停：垂直虚线直接对齐最近采样点 + 当前任务值标记（GPU 同一时间只跑一个任务）
+      if (hoverX != null) {
+        const hoverT = t0 + ((hoverX - padL) / iw) * span;
+
+        // 只处理 hoverT 落在该任务时间范围内的那个任务
+        for (const seg of segments) {
+          if (seg.pts.length < 2) continue;
+          if (hoverT < seg.pts[0][0] || hoverT > seg.pts[seg.pts.length - 1][0]) continue;
+
+          // 找到 hoverT 所在区间的左端点 idx（pts[idx].t <= hoverT < pts[idx+1].t）
+          let idx = nearestIdx(seg.pts, hoverT);
+          if (idx < 0) continue;
+          if (seg.pts[idx][0] > hoverT) idx = Math.max(0, idx - 1);
+          const i0 = idx;
+          const i1 = Math.min(seg.pts.length - 1, i0 + 1);
+          const p0 = seg.pts[i0];
+          const p1 = seg.pts[i1];
+
+          // 最近采样点（竖线对齐它的 x，并在该点画实心标记）
+          const np = Math.abs(hoverT - p0[0]) <= Math.abs(p1[0] - hoverT) ? p0 : p1;
+          const nx = x(np[0]);
+          const ny = y(np[1]);
+
+          // 垂直虚线：对齐最近采样点
+          ctx.strokeStyle = cssVar('--mdui-color-on-surface');
+          ctx.setLineDash([3, 3]);
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.moveTo(nx, padT);
+          ctx.lineTo(nx, h - padB);
+          ctx.stroke();
+          ctx.setLineDash([]);
+
+          // 采样点标记
+          ctx.fillStyle = seg.color;
+          ctx.beginPath();
+          ctx.arc(nx, ny, 4.5, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.strokeStyle = '#fff';
+          ctx.lineWidth = 1.5;
+          ctx.stroke();
+        }
+      }
+
+      // 图例（左上角）：每段颜色 + M 指数
       ctx.textAlign = 'left';
       ctx.font = 'bold 11px sans-serif';
-      ctx.fillText(opts.label, padL, padT - 3);
+      let lx = padL;
+      let ly = padT - 6;
+      for (const seg of segments) {
+        const name = seg.exponent != null ? `M${fmtNumCompact(seg.exponent)}` : (opts.label || '');
+        if (!name) continue;
+        const label = `▍${name}`;
+        ctx.fillStyle = seg.color;
+        ctx.fillText(label, lx, ly);
+        lx += ctx.measureText(label).width + 12;
+        if (lx > w - 40) break;
+      }
+      // 当前速度等附加标签（右上角）
+      if (opts.label && segments.length <= 1) {
+        ctx.fillStyle = textColor;
+        ctx.font = 'bold 11px sans-serif';
+        const tw = ctx.measureText(opts.label).width;
+        ctx.fillText(opts.label, w - padR - tw, padT - 6);
+      }
     }
+
+    /** 在按时间排序的 pts 中找最接近 targetT 的下标 */
+    function nearestIdx(pts, targetT) {
+      let lo = 0;
+      let hi = pts.length - 1;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (pts[mid][0] < targetT) lo = mid + 1;
+        else hi = mid;
+      }
+      if (lo > 0 && Math.abs(pts[lo][0] - targetT) > Math.abs(pts[lo - 1][0] - targetT)) lo--;
+      return lo;
+    }
+
+    render(null);
+
+    // 悬停交互：垂直虚线 + tooltip（任务名 / 时间 / 各任务纵坐标值）
+    if (tipEl) {
+      canvas.onmousemove = (e) => {
+        const rect = canvas.getBoundingClientRect();
+        const mx = e.clientX - rect.left;
+        if (mx < padL || mx > w - padR) {
+          canvas.style.cursor = 'default';
+          tipEl.style.display = 'none';
+          render(null);
+          return;
+        }
+        canvas.style.cursor = 'crosshair';
+        render(mx);
+        const hoverT = t0 + ((mx - padL) / iw) * span;
+        // 组装 tooltip 内容：同一时间只显示正在执行的那个任务（GPU 单任务）
+        const rows = [];
+        let tipTs = hoverT; // 默认鼠标位置时间；有采样点时用最近采样点时间（与竖线对齐）
+        for (const seg of segments) {
+          if (seg.pts.length < 2) continue;
+          if (hoverT < seg.pts[0][0] || hoverT > seg.pts[seg.pts.length - 1][0]) continue;
+          const idx = nearestIdx(seg.pts, hoverT);
+          if (idx < 0) continue;
+          const p = seg.pts[idx];
+          tipTs = p[0];
+          const name = seg.exponent != null ? `M${fmtNumCompact(seg.exponent)}` : (opts.label || '');
+          const vText = opts.valueFmt ? opts.valueFmt(p[1]) : p[1].toFixed(2);
+          rows.push(
+            `<div class="tip-row"><span class="tip-dot" style="background:${seg.color}"></span>` +
+              `<span>${esc(name)}</span><span style="margin-left:auto;font-weight:600">${esc(vText)}</span></div>`
+          );
+        }
+        if (!rows.length) {
+          tipEl.style.display = 'none';
+          return;
+        }
+        tipEl.innerHTML =
+          `<div class="tip-title">${esc(fmtDateTime(tipTs))}</div>` + rows.join('');
+        // 定位：优先放右侧，超出右边界则左移；垂直方向跟随鼠标避免遮挡
+        tipEl.style.display = 'block';
+        const tipW = tipEl.offsetWidth;
+        const tipH = tipEl.offsetHeight;
+        let left = mx + 14;
+        if (left + tipW > w - 4) left = mx - tipW - 14;
+        tipEl.style.left = Math.max(4, left) + 'px';
+        let top = e.clientY - canvas.getBoundingClientRect().top + 12;
+        if (top + tipH > h - 4) top = h - tipH - 4;
+        tipEl.style.top = Math.max(4, top) + 'px';
+      };
+      canvas.onmouseleave = () => {
+        canvas.style.cursor = 'default';
+        tipEl.style.display = 'none';
+        render(null);
+      };
+    } else {
+      canvas.onmousemove = null;
+      canvas.onmouseleave = null;
+    }
+  }
+
+  /** #rrggbb -> rgba() */
+  function hexToRgba(hex, alpha) {
+    const m = /^#?([0-9a-f]{6})$/i.exec(hex);
+    if (!m) return hex;
+    const n = parseInt(m[1], 16);
+    return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${alpha})`;
   }
 
   // ---------------------------------------------------------------- PrimeNet 账户 / 历史任务
@@ -727,7 +919,7 @@
     const certCount = ((statusData && statusData.historyLocal) || []).filter((r) => /^Cert/i.test(r.worktype || '')).length;
 
     $('#pnBody').innerHTML = `
-      <div class="kv-list">
+      <div class="kv-list kv-list--2">
         ${kvRow('person', '用户名', esc(user))}
         ${kvRow('desktop_windows', '活跃计算机', esc(activeComps))}
         ${kvRow('dns', 'PrimeNet 时间', esc(d.primeNetTime ? fmtLocal(d.primeNetTime.replace('T', ' ').slice(0, 19)) : '—'))}
@@ -1555,8 +1747,19 @@
       try {
         const r = await fetch('/api/settings/workpreference', { cache: 'no-store' }).then((x) => x.json());
         if (r && r.ok && r.options) {
+          const def = r.defaultValue != null ? String(r.defaultValue) : '150';
           select.innerHTML = Object.entries(r.options)
-            .map(([v, label]) => `<mdui-menu-item value="${v}">${esc(label)}</mdui-menu-item>`)
+            .map(([v, o]) => {
+              const label = typeof o === 'string' ? o : (o && o.label) || v;
+              const desc = (o && o.desc) || '';
+              const isDefault = v === def;
+              return (
+                `<mdui-menu-item value="${v}" title="${esc(desc)}"${isDefault ? ' active' : ''}>` +
+                `${esc(label)}` +
+                (isDefault ? '<span slot="end-icon" class="wp-default-badge">默认</span>' : '') +
+                `</mdui-menu-item>`
+              );
+            })
             .join('');
           select.value = r.value != null ? String(r.value) : '';
         }

@@ -12,20 +12,32 @@
 const fs = require('fs');
 const path = require('path');
 const { DatabaseSync } = require('node:sqlite');
+const { GPUOWL_PROGRESS_RE, GPUOWL_CERT_PROGRESS_RE, parseGpuowlTs } = require('./gpuowl-parse');
 
-/** gpuowl 进度行正则，与 server.js 中保持一致 */
-const GPUOWL_PROGRESS_RE =
-  /^(\d{8}) (\d{2}:\d{2}:\d{2}) +(\d+) +(?:OK +)?(\d+) +([0-9a-f]{16}) +(\d+)(?: +ETA [^;]+)?/;
-
-/** CERT 进度行：<ts> <exp>  <iter> / <total> <res> <us> ETA */
-const GPUOWL_CERT_PROGRESS_RE =
-  /^(\d{8}) (\d{2}:\d{2}:\d{2}) +(\d+) +(\d+) +\/ +(\d+) +([0-9a-f]{16}) +(\d+)(?: +ETA [^;]+)?/;
-
-function parseGpuowlTs(str) {
-  const m = /^(\d{4})(\d{2})(\d{2}) (\d{2}):(\d{2}):(\d{2})$/.exec(str);
-  if (!m) return null;
-  const [, y, mo, d, h, mi, s] = m.map(Number);
-  return new Date(y, mo - 1, d, h, mi, s).getTime();
+/** 解析单行进度日志 -> 进度点（行格式不合法时返回 null） */
+function parseProgressLine(line, worker) {
+  let p = GPUOWL_PROGRESS_RE.exec(line);
+  let isCert = false;
+  if (!p) {
+    p = GPUOWL_CERT_PROGRESS_RE.exec(line);
+    isCert = !!p;
+  }
+  if (!p) return null;
+  const exp = parseInt(p[3], 10);
+  const iteration = parseInt(p[4], 10);
+  const total = isCert ? parseInt(p[5], 10) : 0;
+  const us = parseInt(isCert ? p[7] : p[6], 10);
+  const ts = parseGpuowlTs(`${p[1]} ${p[2]}`);
+  if (ts == null || !exp || !iteration) return null;
+  return {
+    ts,
+    worker,
+    exponent: exp,
+    iteration,
+    percent: total > 0 ? (iteration / total) * 100 : (iteration / exp) * 100,
+    usPerIter: us > 0 ? us : null,
+    itersPerSec: us > 0 ? 1e6 / us : null,
+  };
 }
 
 class HistoryDB {
@@ -129,41 +141,38 @@ class HistoryDB {
     if (start === size && !forceFull) return 0; // 无新增
     const readStart = forceFull ? 0 : start;
 
+    // 分块读取，避免超大日志一次性载入内存
+    const rows = [];
+    const CHUNK = 1024 * 1024; // 1MB
     const fd = fs.openSync(filePath, 'r');
-    const buf = Buffer.alloc(size - readStart);
-    let off = 0;
-    while (off < buf.length) {
-      const n = fs.readSync(fd, buf, off, buf.length - off, readStart + off);
-      if (n <= 0) break;
-      off += n;
+    let pos = readStart;
+    let pending = ''; // 跨块的行缓冲
+    while (pos < size) {
+      const len = Math.min(CHUNK, size - pos);
+      const buf = Buffer.alloc(len);
+      let off = 0;
+      while (off < len) {
+        const n = fs.readSync(fd, buf, off, len - off, pos + off);
+        if (n <= 0) break;
+        off += n;
+      }
+      pos += off;
+      pending += buf.toString('utf8', 0, off);
+      let nl;
+      while ((nl = pending.indexOf('\n')) >= 0) {
+        const line = pending.slice(0, nl);
+        pending = pending.slice(nl + 1);
+        if (line) {
+          const row = parseProgressLine(line, worker);
+          if (row) rows.push(row);
+        }
+      }
     }
     fs.closeSync(fd);
-    const text = buf.toString('utf8', 0, off);
-
-    const rows = [];
-    for (const line of text.split('\n')) {
-      let p = GPUOWL_PROGRESS_RE.exec(line);
-      let isCert = false;
-      if (!p) {
-        p = GPUOWL_CERT_PROGRESS_RE.exec(line);
-        isCert = !!p;
-      }
-      if (!p) continue;
-      const exp = parseInt(p[3], 10);
-      const iteration = parseInt(p[4], 10);
-      const total = isCert ? parseInt(p[5], 10) : 0;
-      const us = parseInt(isCert ? p[7] : p[6], 10);
-      const ts = parseGpuowlTs(`${p[1]} ${p[2]}`);
-      if (ts == null || !exp || !iteration) continue;
-      rows.push({
-        ts,
-        worker,
-        exponent: exp,
-        iteration,
-        percent: total > 0 ? (iteration / total) * 100 : (iteration / exp) * 100,
-        usPerIter: us > 0 ? us : null,
-        itersPerSec: us > 0 ? 1e6 / us : null,
-      });
+    // 最后一段无换行符的残留内容也尝试解析（可能是被截断的完整行）
+    if (pending) {
+      const row = parseProgressLine(pending, worker);
+      if (row) rows.push(row);
     }
 
     if (rows.length) this.insertPoints(rows);
@@ -225,20 +234,36 @@ class HistoryDB {
       sql += ` AND ts <= ?`;
       args.push(untilMs);
     }
-    sql += ` ORDER BY ts ASC`;
+    // 等距采样（按指数分组）：长 PRP 任务不会把短任务（如 CERT）的点稀释到不足 2 个，
+    // 保证每个任务在图表上都能画出折线；总量仍受 limit 预算约束。
+    const cap = Math.max(limit * 4, 5000);
+    sql += ` ORDER BY ts DESC LIMIT ?`;
+    args.push(cap);
     const stmt = this.db.prepare(sql);
-    const all = stmt.all(...args);
-    if (metric === 'speed') {
-      const points = all.map((r) => [r.ts, r.iters_per_sec, r.exponent]).filter((p) => p[1] != null);
-      return this.sample(points, limit);
+    const all = stmt.all(...args).reverse(); // 转回时间升序
+
+    const groups = new Map();
+    for (const r of all) {
+      const v = metric === 'speed' ? r.iters_per_sec : r.percent;
+      if (v == null) continue;
+      const pt = [r.ts, v, r.exponent];
+      const list = groups.get(r.exponent) || [];
+      list.push(pt);
+      groups.set(r.exponent, list);
     }
-    const points = all.map((r) => [r.ts, r.percent, r.exponent]).filter((p) => p[1] != null);
-    return this.sample(points, limit);
+    const out = [];
+    const maxPerExp = Math.max(10, Math.floor(limit / Math.max(1, groups.size)));
+    for (const list of groups.values()) {
+      const sampled = list.length <= maxPerExp ? list : this.sample(list, maxPerExp);
+      out.push(...sampled);
+    }
+    out.sort((a, b) => a[0] - b[0]);
+    return out;
   }
 
   /** 等距采样，最多 limit 点，保留首尾 */
   sample(points, limit) {
-    if (points.length <= limit) return points;
+    if (points.length <= limit || limit < 2) return points;
     const step = (points.length - 1) / (limit - 1);
     const out = [];
     for (let i = 0; i < limit; i++) {
@@ -271,4 +296,4 @@ function createHistoryDB(dbPath, dataDir) {
   return h;
 }
 
-module.exports = { HistoryDB, createHistoryDB, parseGpuowlTs, GPUOWL_PROGRESS_RE, GPUOWL_CERT_PROGRESS_RE };
+module.exports = { createHistoryDB };

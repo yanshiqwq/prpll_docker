@@ -12,7 +12,6 @@
   let lastHealth = null;
   let lastPrpllRunning = null;
   let apnNextCheckTs = null;
-  let apnTimer = null;
   let prpllFileSig = null;
   let mersenneData = null;
   let mersenneLoaded = false;
@@ -26,6 +25,32 @@
   let importCandidates = [];
   let seenPrimeExps = new Set(); // 已触发过素数弹窗的指数，避免重复
   const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
+
+  // 写接口访问令牌：从 localStorage('gimps_token') 或 URL ?token= 读取。
+  // 未配置时仅影响需要鉴权的 POST 写接口（后端未设 MONITOR_TOKEN 时无需 token）。
+  const AUTH_TOKEN = (() => {
+    try {
+      return (
+        localStorage.getItem('gimps_token') ||
+        new URLSearchParams(location.search).get('token') ||
+        ''
+      );
+    } catch (e) {
+      return '';
+    }
+  })();
+  if (AUTH_TOKEN) {
+    // 全局拦截：所有 POST 请求自动携带 x-auth-token 头
+    const origFetch = window.fetch;
+    window.fetch = (url, opts = {}) => {
+      if (!opts || opts.method === 'POST' || opts.method === 'PATCH' || opts.method === 'DELETE') {
+        const headers = new Headers(opts.headers || {});
+        headers.set('x-auth-token', AUTH_TOKEN);
+        opts = { ...opts, headers };
+      }
+      return origFetch(url, opts);
+    };
+  }
 
   // ---------------------------------------------------------------- 工具函数
   const pad = (n, w = 2) => String(n).padStart(w, '0');
@@ -45,6 +70,13 @@
     if (!utc) return '—';
     const d = new Date(String(utc).replace(' ', 'T') + 'Z');
     return Number.isNaN(d.getTime()) ? String(utc) : fmtDateTime(d.getTime());
+  }
+
+  /** 历史完成时间显示：仅日期的记录用 --:--:-- 占位（避免显示默认的 00:00 UTC 换算时间） */
+  function fmtHistoryDate(r) {
+    if (r.dateOnly && r.date) return `${r.date} --:--:--`;
+    if (r.dateTs) return fmtLocal(r.dateTs.slice(0, 19));
+    return r.date || '—';
   }
 
   function fmtNum(n) {
@@ -118,6 +150,8 @@
       'LL-D': 'LL 双检',
       LLDC: 'LL 双检',
       CERT: '证书验证',
+      Cert: '证书验证',
+      'PRP-3': 'PRP',
       TF: '试除',
       'P-1': 'P-1',
       'P+1': 'P+1',
@@ -306,7 +340,7 @@
       );
       rows.push(
         `<div class="kv-list kv-list--2">
-          ${kvRow('pin', '迭代进度', `<b>${fmtNum(w.iteration)}</b> / ${fmtNum(w.exponent)}`)}
+          ${kvRow('pin', '迭代进度', `<b>${fmtNum(w.iteration)}</b> / ${fmtNum(w.total || w.exponent)}`)}
           ${kvRow('timer', '预计完成', w.etaSec != null ? `<span class="timer">${fmtDur(w.etaSec)}</span><br><small style="font-weight:400">${fmtDateTime(w.etaAt)}</small>` : '—')}
           ${kvRow('bolt', '计算速度', w.itersPerSec != null ? `${w.itersPerSec.toFixed(1)} 迭代/秒` : '—')}
           ${kvRow('hourglass_top', '单次迭代', w.usPerIter != null ? `${fmtNum(w.usPerIter)} µs` : '—')}
@@ -392,11 +426,19 @@
     box.innerHTML = queue
       .map((q, i) => {
         const typeClass = q.worktype === 'PRPDC' ? 'dc' : q.worktype === 'CERT' ? 'cert' : '';
+        const bitsText =
+          q.worktype === 'CERT'
+            ? q.bits != null
+              ? `验证 ${fmtNum(q.bits)} 次平方`
+              : '证书验证任务'
+            : q.bits != null
+              ? `已试除 ${fmtNum(q.bits)} bits`
+              : '';
         return `<div class="sub-row">
           <span class="type-badge ${typeClass}">${esc(q.worktypeLabel || q.worktype)}</span>
           <div class="main">
             <div class="t1">M${fmtNum(q.exponent)}</div>
-            <div class="t2">${esc(q.file)} · 已试除 ${fmtNum(q.bits)} bits${aidHtml(q.aid)}</div>
+            <div class="t2">${esc(q.file)}${bitsText ? ' · ' + bitsText : ''}${aidHtml(q.aid)}</div>
           </div>
           <div class="right">#${i + 1}</div>
         </div>`;
@@ -421,14 +463,17 @@
     };
     box.innerHTML = results
       .map((r) => {
-        const st = statusMap[r.status] || { cls: '', text: r.status || '?' };
+        const isCert = /^Cert/i.test(r.worktype || '');
+        const st = isCert
+          ? { cls: 'cert', text: '验证通过' }
+          : statusMap[r.status] || { cls: '', text: r.status || '?' };
         return `<div class="sub-row">
           <span class="result-status ${st.cls}" title="${esc(st.text)}">${esc(st.text.charAt(0))}</span>
           <div class="main">
             <div class="t1">M${fmtNum(r.exponent)}</div>
-            <div class="t2">${esc(r.timestamp || '')} · ${esc(r.worktype || '')} · ${esc(r.program || '')}${r.errors != null ? ` · Gerbicz 错误 ${r.errors}` : ''}</div>
+            <div class="t2">${esc(r.timestamp ? fmtLocal(r.timestamp) : '')} · ${esc(workTypeLabel(r.worktype) || '')} · ${esc(r.program || '')}${r.errors != null ? ` · Gerbicz 错误 ${esc(r.errors)}` : ''}${r.squarings != null ? ` · ${fmtNum(r.squarings)} 次平方` : ''}</div>
           </div>
-          <div class="right mono">${esc((r.res64 || '').slice(0, 12))}</div>
+          <div class="right mono">${esc((isCert ? r.sha3 || '' : r.res64 || '').slice(0, 12))}</div>
         </div>`;
       })
       .join('');
@@ -501,6 +546,21 @@
     return map[chartRange] != null ? map[chartRange] : Infinity;
   }
 
+  /** 图表空状态文案：区分“任务刚开始/进度点不足”与“该范围确实无数据” */
+  function chartEmptyNote(worker, points) {
+    if (worker && worker.exponent != null) {
+      const cur = (points || []).filter((p) => p[2] === worker.exponent).length;
+      if (cur < 2) {
+        const per = worker.usPerIter
+          ? Math.max(1, Math.round((100000 * worker.usPerIter) / 60000))
+          : null;
+        const base = '当前任务刚开始，进度点不足 2 个，暂无法绘制折线（每 10 万次平方记录一个点）';
+        return per ? `${base}，预计约 ${per} 分钟后出现` : base;
+      }
+    }
+    return '该时间范围暂无数据';
+  }
+
   function drawCharts(prpll) {
     const worker = prpll.workers && prpll.workers[0];
     if (!worker) {
@@ -526,7 +586,7 @@
       yFmt: (v) => v.toFixed(0) + '%',
       valueFmt: (v) => v.toFixed(2) + '%',
       label: worker.exponent ? `M${fmtNumCompact(worker.exponent)}` : '',
-      emptyText: '该时间范围暂无数据',
+      emptyText: chartEmptyNote(worker, progInRange),
     });
 
     drawLineChart($('#speedChart'), $('#speedTip'), speedInRange, {
@@ -534,7 +594,7 @@
       yFmt: (v) => fmtNumCompact(v) + '/s',
       valueFmt: (v) => fmtNumCompact(v) + ' 迭代/秒',
       label: worker.itersPerSec != null ? `${worker.itersPerSec.toFixed(1)} 迭代/秒` : '',
-      emptyText: '该时间范围暂无数据',
+      emptyText: chartEmptyNote(worker, speedInRange),
       showAvg: true,
     });
   }
@@ -987,19 +1047,56 @@
     return (statusData && statusData.prime && statusData.prime.computerId) || null;
   }
 
+  /** 行完成时间转 epoch（毫秒）：dateTs 一律按 UTC 解析（PRPLL 结果与 PrimeNet 时间戳均为 UTC） */
+  function completionTsOf(row) {
+    if (!row.dateTs) return null;
+    const s = String(row.dateTs).replace(' ', 'T');
+    const t = Date.parse(s.endsWith('Z') ? s : s + 'Z');
+    return Number.isNaN(t) ? null : t;
+  }
+
   /** 合并 PrimeNet 历史 + 本地 CERT 记录，并补充总耗时 / 本机标记 */
   function getAllHistoryRows() {
     const d = mersenneData;
     const base = (d && d.results) || [];
     const elapsed = (statusData && statusData.elapsed) || {};
+    const assignedAt = (statusData && statusData.assignedAt) || {};
     const localName = localComputerName();
 
+    // 本地结果按指数取最新时间戳（PRPLL 结果时间戳为 UTC），用于补全本机任务的精确完成时间
+    const localByExp = new Map();
+    for (const r of statusData && statusData.historyLocal ? statusData.historyLocal : []) {
+      if (!r.timestamp) continue;
+      const cur = localByExp.get(r.exponent);
+      if (!cur || r.timestamp > cur.timestamp) localByExp.set(r.exponent, r);
+    }
+
     // PrimeNet 历史（LL / PRP）
-    const primeRows = base.map((r) => ({
-      ...r,
-      local: localName ? String(r.computer || '').toLowerCase().includes(localName.toLowerCase()) : false,
-      elapsedSec: elapsed[r.exponent] != null ? elapsed[r.exponent] : null,
-    }));
+    const primeRows = base.map((r) => {
+      const local = localName ? localByExp.get(r.exponent) : null;
+      const row = {
+        ...r,
+        local: localName ? String(r.computer || '').toLowerCase().includes(localName.toLowerCase()) : false,
+        elapsedSec: elapsed[r.exponent] != null ? elapsed[r.exponent] : null,
+        elapsedNote: null,
+      };
+      // PrimeNet 只给日期时，用本机结果里的精确完成时间（UTC）补全，dateOnly 置 false 走本地时间显示
+      if (local && row.local && local.timestamp) {
+        row.date = local.timestamp;
+        row.dateTs = local.timestamp;
+        row.dateOnly = false;
+      }
+      // 在线任务：有精确完成时间时，总耗时优先显示"领取任务（PrimeNet 分配）→ 完成"
+      if (!row.dateOnly) {
+        const done = completionTsOf(row);
+        const asg = assignedAt[r.exponent];
+        if (done && asg && done > asg) {
+          row.elapsedSec = Math.round((done - asg) / 1000);
+          row.elapsedNote = '领取任务到完成任务总耗时';
+        }
+      }
+      return row;
+    });
 
     // 本地结果：只取 CERT（LL/PRP 以 PrimeNet 为准），去重取最新一条
     const certMap = new Map();
@@ -1012,11 +1109,12 @@
     const certRows = [...certMap.values()].map((r) => ({
       type: 'CERT',
       exponent: r.exponent,
-      residue: r.res64 || '—',
+      residue: r.res64 || (r.sha3 ? `sha3:${r.sha3.slice(0, 16)}` : '—'),
       computer: '本机',
       software: r.program || '—',
       date: r.timestamp || '',
-      dateTs: null, // 本地时间戳，直接展示
+      dateTs: r.timestamp || null, // PRPLL 结果时间戳为 UTC，由 fmtLocal 转为本地显示
+      dateOnly: false,
       local: true,
       elapsedSec: elapsed[r.exponent] != null ? elapsed[r.exponent] : null,
     }));
@@ -1065,8 +1163,8 @@
           <td class="residue truncate" title="${esc(r.residue || '')}">${esc(r.residue || '—')}</td>
           <td class="truncate" title="${esc(r.computer || '')}">${esc(r.computer || '—')}${r.local ? ' <span class="tag-local">本机</span>' : ''}</td>
           <td class="truncate" title="${esc(r.software || '')}">${esc(r.software || '—')}</td>
-          <td class="truncate" title="${esc(r.dateTs ? fmtLocal(r.dateTs.slice(0, 19)) : r.date || '—')}">${esc(r.dateTs ? fmtLocal(r.dateTs.slice(0, 19)) : r.date || '—')}</td>
-          <td>${r.elapsedSec != null ? fmtDur(r.elapsedSec) : '—'}</td>
+          <td class="truncate" title="${esc(fmtHistoryDate(r))}">${esc(fmtHistoryDate(r))}</td>
+          <td title="${esc(r.elapsedNote || '')}">${r.elapsedSec != null ? fmtDur(r.elapsedSec) : '—'}</td>
         </tr>`
       )
       .join('');
@@ -1101,7 +1199,7 @@
       const csvCell = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
       const head = ['类型', '指数', 'Residue', '计算机', '软件', '完成日期', '总耗时'];
       const lines = rows.map((r) =>
-        [r.type, r.exponent, r.residue, r.computer, r.software, r.dateTs || r.date, r.elapsedSec != null ? fmtDur(r.elapsedSec) : '']
+        [r.type, r.exponent, r.residue, r.computer, r.software, r.dateOnly ? r.date : r.dateTs || r.date, r.elapsedSec != null ? fmtDur(r.elapsedSec) : '']
           .map(csvCell)
           .join(',')
       );
@@ -1159,24 +1257,40 @@
       kvRow('timer', '预计完成', esc(eta)),
     ];
     if (isRunning && w) {
-      rows.push(kvRow('pin', '迭代进度', `<b>${fmtNum(w.iteration)}</b> / ${fmtNum(w.exponent)}`));
+      rows.push(kvRow('pin', '迭代进度', `<b>${fmtNum(w.iteration)}</b> / ${fmtNum(w.total || w.exponent)}`));
       rows.push(kvRow('bolt', '计算速度', w.itersPerSec != null ? `${w.itersPerSec.toFixed(1)} 迭代/秒` : '—'));
       if (w.percent != null) {
         bar = `<div class="progress-row dialog-bar"><mdui-linear-progress value="${Math.min(1, Math.max(0, w.percent / 100))}"></mdui-linear-progress><span class="progress-pct">${w.percent.toFixed(2)}%</span></div>`;
       }
     } else if (q) {
-      rows.push(kvRow('data_object', '试除位数', `${fmtNum(q.bits)} bits${aidHtml(q.aid)}`));
+      const bitsText =
+        q.worktype === 'CERT'
+          ? q.bits != null
+            ? `验证 ${fmtNum(q.bits)} 次平方`
+            : '证书验证任务'
+          : q.bits != null
+            ? `试除位数 ${fmtNum(q.bits)} bits`
+            : '';
+      rows.push(kvRow('data_object', q.worktype === 'CERT' ? '验证范围' : '试除位数', `${bitsText}${aidHtml(q.aid)}`));
     }
     return `<div class="dialog-status">${bar}<div class="kv-list kv-list--2">${rows.join('')}</div></div>`;
   }
 
   function taskRowHtml(t, actions, running) {
     const isRunning = running && t.exponent === running;
+    const bitsText =
+      t.type === 'CERT'
+        ? t.bits != null
+          ? '验证 ' + fmtNum(t.bits) + ' 次平方'
+          : ''
+        : t.bits != null
+          ? '已试除 ' + fmtNum(t.bits) + ' bits'
+          : '';
     return `<div class="sub-row task-row ${isRunning ? 'running' : ''}">
       <span class="type-badge ${workTypeClass(t.type)}">${esc(workTypeLabel(t.type))}</span>
       <div class="main">
         <div class="t1">M${fmtNum(t.exponent)}${isRunning ? '<span class="running-tag">运行中</span>' : ''}</div>
-        <div class="t2">${esc(t.file || '')}${t.lineNo ? ' · 第 ' + t.lineNo + ' 行' : ''}${t.bits != null ? ' · 已试除 ' + fmtNum(t.bits) + ' bits' : ''}${aidHtml(t.aid)}</div>
+        <div class="t2">${esc(t.file || '')}${t.lineNo ? ' · 第 ' + t.lineNo + ' 行' : ''}${bitsText ? ' · ' + bitsText : ''}${aidHtml(t.aid)}</div>
       </div>
       <div class="task-actions">${actions}</div>
     </div>`;
@@ -1556,6 +1670,16 @@
     const appendPlain = (lines) => {
       const frag = lines.map((l) => `<span class="log-line ${l.level}">${esc(l.text)}</span>`).join('\n');
       preEl.insertAdjacentHTML('beforeend', '\n' + frag);
+      // 截断 DOM：仅保留最近 MAX_SNAPSHOT 行，防止长跑后节点无限增长（M5）
+      const spans = preEl.querySelectorAll('.log-line');
+      if (spans.length > MAX_SNAPSHOT) {
+        const excess = spans.length - MAX_SNAPSHOT;
+        for (let i = 0; i < excess; i++) {
+          const first = preEl.querySelector('.log-line');
+          if (first) first.remove();
+          else break;
+        }
+      }
       preEl.scrollTop = preEl.scrollHeight;
       updateStatus(`共 ${snapshot.length} 行`);
     };

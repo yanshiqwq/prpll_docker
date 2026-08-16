@@ -18,6 +18,7 @@ const path = require('path');
 const mersenne = require('./mersenne');
 const tasks = require('./tasks');
 const { createHistoryDB } = require('./db');
+const { GPUOWL_PROGRESS_RE, GPUOWL_CERT_PROGRESS_RE, parseGpuowlTs } = require('./gpuowl-parse');
 
 const ROOT = __dirname;
 const PUBLIC_DIR = path.join(ROOT, 'public');
@@ -26,6 +27,18 @@ const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(ROOT, '..', 'dat
 const PORT = parseInt(process.env.PORT || '8080', 10);
 const HOST = process.env.HOST || '0.0.0.0';
 const HISTORY_DB_PATH = path.join(DATA_DIR, 'monitor.sqlite');
+// 控制接口访问令牌：设置 MONITOR_TOKEN 后，所有 POST /api/* 写操作必须携带 x-auth-token 头。
+// 默认不开启（保持前端开箱即用），但会打印安全提醒；建议在暴露到公网/局域网时设置。
+// 前端如需携带 token，可在页面加载后给所有 fetch 注入 x-auth-token 头（app.js 中实现）。
+const AUTH_TOKEN = process.env.MONITOR_TOKEN && process.env.MONITOR_TOKEN !== 'none' ? process.env.MONITOR_TOKEN : '';
+if (!AUTH_TOKEN) {
+  console.log('[monitor] 警告：未设置 MONITOR_TOKEN，写接口（取消/暂停/导入/改设置）无鉴权保护。');
+  console.log('[monitor] 若面板暴露到不可信网络，请设置环境变量 MONITOR_TOKEN 并同步配置前端。');
+} else if (AUTH_TOKEN === 'none') {
+  console.log('[monitor] MONITOR_TOKEN=none，写接口鉴权已显式关闭。');
+} else {
+  console.log('[monitor] 写接口鉴权已启用（MONITOR_TOKEN 已设置）。');
+}
 
 // 历史数据持久化（SQLite，Node 24 内置 node:sqlite）
 // 初始化失败直接抛出错误，让进程以非零退出码退出（不静默回退）
@@ -35,15 +48,15 @@ console.log(`[monitor] 历史数据库已就绪: ${HISTORY_DB_PATH}`);
 const LOG_NAME_RE = /^(gpuowl-\d+\.log|autoprimenet\.log)$/;
 const MAX_TAIL_BYTES = 8 * 1024 * 1024; // 最多读取 8MB 尾部用于解析
 const MAX_LOG_LINES = 1000;             // /api/log 默认最多返回行数
+const APN_SCAN_BYTES = 2 * 1024 * 1024; // 全文件扫描 AutoPrimeNet 版本/目录行的最大字节数
+const APN_PARSE_TAIL_LINES = 400;       // AutoPrimeNet 逐行解析的尾部行数
+const INI_MAX_BYTES = 64 * 1024;        // prime.ini 读取上限
+const RESULTS_MAX_BYTES = 16 * 1024 * 1024; // results-*.txt 读取上限
+const RECENT_RESULTS = 20;              // /api/status 返回的最近结果条数
 
 // ---------------------------------------------------------------- 小工具
 
 const pad = (n, w = 2) => String(n).padStart(w, '0');
-
-function fmtTime(ts) {
-  const d = new Date(ts);
-  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
-}
 
 function fmtDateTime(ts) {
   const d = new Date(ts);
@@ -62,14 +75,6 @@ function fmtDuration(sec) {
   if (m) parts.push(`${m} 分`);
   if (s && !d) parts.push(`${s} 秒`);
   return parts.join(' ') || '0 秒';
-}
-
-/** 解析 gpuowl 时间戳 "20260813 15:43:49" -> epoch 毫秒（本地时区） */
-function parseGpuowlTs(str) {
-  const m = /^(\d{4})(\d{2})(\d{2}) (\d{2}):(\d{2}):(\d{2})$/.exec(str);
-  if (!m) return null;
-  const [, y, mo, d, h, mi, s] = m.map(Number);
-  return new Date(y, mo - 1, d, h, mi, s).getTime();
 }
 
 /** 解析 "2026-08-13 17:43:02" -> epoch 毫秒 */
@@ -136,7 +141,7 @@ function fileInfo(name) {
 
 /** 等距采样，最多 N 个点，保留首尾 */
 function sample(points, n) {
-  if (points.length <= n) return points;
+  if (points.length <= n || n < 2) return points;
   const step = (points.length - 1) / (n - 1);
   const out = [];
   for (let i = 0; i < n; i++) {
@@ -147,13 +152,6 @@ function sample(points, n) {
 }
 
 // ---------------------------------------------------------------- PRPLL 解析
-
-const GPUOWL_PROGRESS_RE =
-  /^(\d{8}) (\d{2}:\d{2}:\d{2}) +(\d+) +(?:OK +)?(\d+) +([0-9a-f]{16}) +(\d+)(?: +ETA [^;]+)?/;
-
-// CERT 进度行：<ts> <exp>  <iter> / <total> <res> <us> ETA
-const GPUOWL_CERT_PROGRESS_RE =
-  /^(\d{8}) (\d{2}:\d{2}:\d{2}) +(\d+) +(\d+) +\/ +(\d+) +([0-9a-f]{16}) +(\d+)(?: +ETA [^;]+)?/;
 
 /** 按文件 stat 做缓存的工具：文件未变化时复用解析结果 */
 const fileCache = new Map();
@@ -183,7 +181,17 @@ function finalizeWorker(w) {
   let status = 'stopped';
   let statusNote = '未检测到日志';
   if (w.lastLogAt) {
-    if (lastLogAgoSec < 10 * 60) {
+    if (w.lastLineIsBye) {
+      // 日志末尾是 Bye：进程已退出（崩溃或正常停止），容器很可能正在重启
+      status = 'stopped';
+      statusNote =
+        w.restartCountRecent >= 3
+          ? `进程反复崩溃退出（近 10 分钟 ${w.restartCountRecent} 次），请检查日志/任务文件`
+          : '进程已退出（日志末尾为 Bye）';
+    } else if (w.restartCountRecent >= 3) {
+      status = 'warning';
+      statusNote = `检测到反复重启（近 10 分钟 ${w.restartCountRecent} 次），请检查日志/任务文件`;
+    } else if (lastLogAgoSec < 10 * 60) {
       status = 'running';
       statusNote = `最后日志 ${fmtDuration(lastLogAgoSec)} 前`;
     } else if (lastLogAgoSec < 60 * 60) {
@@ -237,6 +245,18 @@ function parseGpuowlLog(name) {
     if (/PRPLL \S+ starting/.test(line)) startCount++;
   }
 
+  // 近 10 分钟内的启动次数（覆盖整个尾部窗口，用于识别崩溃循环）
+  let restartCountRecent = 0;
+  const RECENT_WINDOW_MS = 10 * 60 * 1000;
+  const nowMs = Date.now();
+  for (const line of lines) {
+    if (/PRPLL \S+ starting/.test(line)) {
+      const m = /^(\d{8} \d{2}:\d{2}:\d{2})/.exec(line);
+      const ts = m ? parseGpuowlTs(m[1]) : null;
+      if (ts && nowMs - ts < RECENT_WINDOW_MS) restartCountRecent++;
+    }
+  }
+
   const session = sessionStartIdx >= 0 ? lines.slice(sessionStartIdx) : lines;
 
   let version = null;
@@ -246,6 +266,7 @@ function parseGpuowlLog(name) {
   let lastProgress = null;   // 最近一条进度/OK 行
   let lastOk = null;         // 最近 OK 行
   let currentExponent = null;
+  let byeCount = 0;           // 当前会话内崩溃退出（Bye）次数
   const warnings = [];
   const progressHistory = []; // [tsEpoch, percent]
   const speedHistory = [];    // [tsEpoch, itersPerSec]
@@ -256,6 +277,10 @@ function parseGpuowlLog(name) {
 
     if (/PRPLL (\S+) starting/.test(line)) {
       version = /PRPLL (\S+) starting/.exec(line)[1];
+      continue;
+    }
+    if (/^\d{8} \d{2}:\d{2}:\d{2}\s+Bye\s*$/.test(line)) {
+      byeCount++;
       continue;
     }
     if (!ts) continue;
@@ -334,12 +359,14 @@ function parseGpuowlLog(name) {
         iteration,
         total,
         usPerIter: us,
-        ok: false,
+        ok: total > 0 && iteration >= total,
         etaSec: etaM ? parseEta(etaM[1]) : null,
         etaText: etaM ? etaM[1].trim() : null,
         z: null,
         avg: null,
       };
+      // 证书验证完成行（迭代 == 总数）也记入"最近校验"
+      if (lastProgress.ok) lastOk = lastProgress;
 
       // 历史点（按当前指数），CERT 以 squarings 总数计算百分比
       if (currentExponent) {
@@ -349,14 +376,19 @@ function parseGpuowlLog(name) {
       continue;
     }
 
-    // 告警 / 错误行
-    if (/(WARNING|ERROR|error|stuck|abort|restarting)/i.test(line) && !/errors":\d+/.test(line)) {
+    // 告警 / 错误行（结果 JSON 行含 "error-code"/"errors" 字段，需排除）
+    if (
+      /(WARNING|ERROR|error|stuck|abort|restarting)/i.test(line) &&
+      !/^.*\{"/.test(line) &&
+      !/"exponent":\d+/.test(line)
+    ) {
       warnings.push(line);
     }
   }
 
   const lastLine = lines[lastIdx];
   const lastLogAt = parseGpuowlTs(lastLine ? lastLine.slice(0, 17) : '') || data.mtimeMs;
+  const lastLineIsBye = /^\d{8} \d{2}:\d{2}:\d{2}\s+Bye\s*$/.test(lastLine || '');
 
   // 当前任务信息
   let exponent = lastProgress ? lastProgress.exponent : null;
@@ -404,11 +436,15 @@ function parseGpuowlLog(name) {
     logSize: data.size,
     lastLogAt,
     startCount,
+    restartCountRecent,
+    byeCount,
+    lastLineIsBye,
     sessionStartAt,
     version,
     device,
     exponent,
     iteration,
+    total,
     usPerIter,
     itersPerSec: itersPerSec ? +itersPerSec.toFixed(2) : null,
     percent: percent != null ? +percent.toFixed(4) : null,
@@ -471,7 +507,7 @@ function scanApnPersistent() {
     const st = fs.statSync(filePath);
     if (!st.size) return apnPersistent;
     // 避免一次性读取超大文件：只读尾部 2MB（版本/目录行在每次启动时都会重新出现）
-    const bytes = Math.min(st.size, 2 * 1024 * 1024);
+    const bytes = Math.min(st.size, APN_SCAN_BYTES);
     const fd = fs.openSync(filePath, 'r');
     const buf = Buffer.alloc(bytes);
     const read = fs.readSync(fd, buf, 0, bytes, st.size - bytes);
@@ -521,7 +557,7 @@ function parseApnInternal() {
   }
   out.logSize = data.size;
   const lines = data.lines;
-  const tail = lines.slice(-400);
+  const tail = lines.slice(-APN_PARSE_TAIL_LINES);
   const assignments = new Map();
 
   for (const line of tail) {
@@ -576,7 +612,7 @@ function parseApnInternal() {
       out.queueDaysRequested = parseFloat(queueM[2]);
     }
 
-    const watchM = /Watching the directory: '(.+)'/.exec(msg);
+    const watchM = /Watching the directory: '([^']+)'/.exec(msg);
     if (watchM) {
       out.watcher = watchM[1];
       apnPersistent.watcher = watchM[1];
@@ -669,7 +705,7 @@ function parseDuration(text) {
 
 function parseIni() {
   return cachedParse('ini', ['prime.ini'], () => {
-    const data = tailFile(path.join(DATA_DIR, 'prime.ini'), 64 * 1024);
+    const data = tailFile(path.join(DATA_DIR, 'prime.ini'), INI_MAX_BYTES);
     if (!data) return null;
     const kv = {};
     for (const line of data.text.split('\n')) {
@@ -687,7 +723,7 @@ function parseIni() {
       workPreference: kv.WorkPreference || null,
       maxExponents: kv.MaxExponents ? +kv.MaxExponents : null,
       rollingAverage: kv.RollingAverage ? +kv.RollingAverage : null,
-      msecPerIter: kv.msec_per_iter ? parseFloat(kv.msec_per_iter) : null,
+      msecPerIter: kv.msec_per_iter ? (Number.isFinite(+kv.msec_per_iter) ? +kv.msec_per_iter : null) : null,
       exponent: kv.exponent ? +kv.exponent : null,
       workFile: kv.work_file || null,
       resultsFile: kv.results_file || null,
@@ -711,6 +747,23 @@ function parseCertworkFiles() {
       });
     }
     return list;
+  });
+}
+
+/** 从 AutoPrimeNet 日志提取每个指数首次领取（Got assignment）的时间戳（epoch 毫秒） */
+function parseAssignedAt() {
+  const name = 'autoprimenet.log';
+  return cachedParse('assigned-at', [name], () => {
+    const data = tailFile(path.join(DATA_DIR, name), RESULTS_MAX_BYTES);
+    if (!data) return {};
+    const out = {};
+    for (const line of data.text.split('\n')) {
+      const m = /^\[\w+ (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\.\d+\]\s+\w+: Got assignment [0-9A-F]{32}: \w+ M(\d+)/.exec(line);
+      if (!m) continue;
+      const exp = parseInt(m[2], 10);
+      if (out[exp] == null) out[exp] = parseIsoTs(m[1]); // AutoPrimeNet 日志为本地时间
+    }
+    return out;
   });
 }
 
@@ -766,6 +819,8 @@ function parseResultsFiles() {
             status: j.status,
             worktype: j.worktype,
             res64: j.res64,
+            sha3: j['sha3-hash'] || null,
+            squarings: j.squarings != null ? +j.squarings : null,
             timestamp: j.timestamp,
             errors: j.errors ? j.errors.gerbicz : null,
             fftLength: j['fft-length'],
@@ -799,6 +854,7 @@ function parseAllLocalResults() {
             status: j.status,
             worktype: j.worktype,
             res64: j.res64,
+            sha3: j['sha3-hash'] || null,
             timestamp: j.timestamp,
             program: j.program ? `${j.program.name} ${j.program.version}` : null,
           });
@@ -933,15 +989,19 @@ function setWorkPreference(value) {
     return { ok: false, error: '无法读取 prime.ini' };
   }
   const lines = text.split('\n');
+  const out = [];
   let replaced = false;
-  const out = lines.map((line) => {
-    const m = /^(\s*WorkPreference\s*=\s*)\d+\s*$/.exec(line);
-    if (m) {
-      replaced = true;
-      return `${m[1]}${v}`;
+  for (const line of lines) {
+    if (/^\s*WorkPreference\s*=/.test(line)) {
+      // 已有该键：替换第一个，丢弃重复行（兼容带行尾注释的写法，避免插入重复键）
+      if (!replaced) {
+        out.push(`WorkPreference = ${v}`);
+        replaced = true;
+      }
+      continue;
     }
-    return line;
-  });
+    out.push(line);
+  }
   if (!replaced) {
     // 在 [PrimeNet] 段首行后插入一行
     const res = [];
@@ -1048,10 +1108,26 @@ function buildStatus() {
   syncHistoryFromLogs();
   const prpll = parsePrpll();
   const prime = parseIni();
-  const queue = parseWorktodoFiles();
+  // 工作队列 = worktodo-*.txt + certwork-*.txt（CERT 任务可能尚未被 AutoPrimeNet 移入 worktodo）
+  const queue = [
+    ...parseWorktodoFiles(),
+    ...parseCertworkFiles().map((c) => ({
+      file: c.file,
+      order: c.order,
+      exponent: c.exponent,
+      worktype: 'CERT',
+      worktypeLabel: '证书验证',
+      aid: c.aid,
+      bits: null,
+    })),
+  ].sort((a, b) => a.file.localeCompare(b.file) || a.order - b.order);
   if (prime && prime.username) mersenne.setUsername(prime.username);
   const apnRaw = cachedParse('apn', ['autoprimenet.log'], parseApnInternal);
-  const apn = apnRaw; // 先合并配置，再计算时间相关字段
+  // 浅拷贝 + assignments 深拷贝，避免改写 cachedParse 缓存的同一引用（M4）
+  const apn = {
+    ...apnRaw,
+    assignments: (apnRaw.assignments || []).map((a) => ({ ...a })),
+  };
   if (prime && prime.hoursBetweenCheckins) apn.checkIntervalH = prime.hoursBetweenCheckins;
   apn.user = apn.user || (prime && prime.username) || null;
   apn.cpuBrand = apn.cpuBrand || (prime && prime.cpuBrand) || null;
@@ -1085,8 +1161,9 @@ function buildStatus() {
     apn: finalizedApn,
     prime,
     queue,
-    results: parseResultsFiles().slice(0, 20),
+    results: parseResultsFiles().slice(0, RECENT_RESULTS),
     historyLocal: parseAllLocalResults(),
+    assignedAt: parseAssignedAt(),
     files: ['gpuowl-0.log', 'autoprimenet.log', 'worktodo-0.txt', 'worktodo.txt', 'results-0.txt', 'prime.ini', 'config.txt']
       .map(fileInfo),
     elapsed: parseElapsedMap(),
@@ -1128,7 +1205,7 @@ function getLogLines(name, linesCount = 200) {
     name,
     size: data.size,
     mtime: data.mtimeMs,
-    totalLines: data.lines.length,
+    tailLines: data.lines.length,
     lines: rawLines.map((text, i) => ({
       index: data.lines.length - rawLines.length + i,
       level: classify(text),
@@ -1175,28 +1252,48 @@ function sendText(res, status, text, type) {
 function readJsonBody(req) {
   return new Promise((resolve, reject) => {
     let body = '';
+    const MAX_BODY = 1024 * 1024;
+    const timeout = setTimeout(() => {
+      reject(new Error('读取请求体超时'));
+      req.destroy();
+    }, 10000);
+    const done = (fn, arg) => {
+      clearTimeout(timeout);
+      fn(arg);
+    };
     req.on('data', (chunk) => {
       body += chunk;
-      if (body.length > 1024 * 1024) {
-        reject(new Error('请求体过大'));
+      if (body.length > MAX_BODY) {
+        done(reject, new Error('请求体过大'));
         req.destroy();
       }
     });
     req.on('end', () => {
-      if (!body.trim()) return resolve({});
+      if (!body.trim()) return done(resolve, {});
       try {
-        resolve(JSON.parse(body));
+        done(resolve, JSON.parse(body));
       } catch (e) {
-        reject(new Error('请求体不是合法 JSON'));
+        done(reject, new Error('请求体不是合法 JSON'));
       }
     });
-    req.on('error', reject);
+    req.on('error', (e) => done(reject, e));
   });
 }
 
 function serveStatic(res, urlPath) {
-  let rel = decodeURIComponent(urlPath).replace(/^\/+/, '');
-  if (rel === '/' || rel === '') rel = '/index.html';
+  let rel;
+  try {
+    rel = decodeURIComponent(urlPath).replace(/^\/+/, '');
+  } catch (e) {
+    sendText(res, 400, '请求错误');
+    return;
+  }
+  if (rel === '/' || rel === '' || rel === '/index.html') rel = 'index.html';
+  // 路径穿越防护：拒绝任何含 .. 或绝对路径的候选（new URL 不解析 %2e/%2f 编码）
+  if (/\.\./.test(rel) || rel.startsWith('/') || /^[a-zA-Z]:/.test(rel)) {
+    sendText(res, 404, '未找到');
+    return;
+  }
   const candidates = [];
   if (rel.startsWith('vendor/')) {
     candidates.push(path.join(VENDOR_DIR, rel.slice('vendor/'.length)));
@@ -1205,12 +1302,14 @@ function serveStatic(res, urlPath) {
     candidates.push(path.join(VENDOR_DIR, rel));
   }
   for (const filePath of candidates) {
-    if (!filePath.startsWith(ROOT + path.sep)) continue;
+    // 归一化后再校验，确保解析后的路径仍在 ROOT 内（防编码穿越）
+    const resolved = path.resolve(filePath);
+    if (resolved !== ROOT && !resolved.startsWith(ROOT + path.sep)) continue;
     try {
-      const st = fs.statSync(filePath);
+      const st = fs.statSync(resolved);
       if (!st.isFile()) continue;
-      const ext = path.extname(filePath).toLowerCase();
-      const body = fs.readFileSync(filePath);
+      const ext = path.extname(resolved).toLowerCase();
+      const body = fs.readFileSync(resolved);
       res.writeHead(200, {
         'Content-Type': MIME[ext] || 'application/octet-stream',
         'Cache-Control': 'no-cache',
@@ -1222,7 +1321,7 @@ function serveStatic(res, urlPath) {
       // 尝试下一个候选路径
     }
   }
-  sendText(res, 404, 'Not Found');
+  sendText(res, 404, '未找到');
 }
 
 function handleLogStream(req, res, name, linesCount) {
@@ -1238,24 +1337,51 @@ function handleLogStream(req, res, name, linesCount) {
   let timer = null;
   let lastSize = -1;
   let lastMtime = -1;
+  let lastIno = -1;
 
-  const emit = (event, data) => {
-    res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  // 客户端已断开或 socket 已销毁时不写入，避免对已销毁 socket 抛 ERR_STREAM_DESTROYED 崩掉进程
+  const isClosed = () => res.writableEnded || res.destroyed || req.aborted;
+  const safeEmit = (event, data) => {
+    if (isClosed()) return;
+    try {
+      res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    } catch (e) {
+      /* 忽略写入失败 */
+    }
   };
 
+  const emit = safeEmit;
+  let heartbeat = null;
+  // 底层 socket 报错（如客户端重置）时停止所有定时器
+  res.on('error', () => {
+    clearInterval(timer);
+    if (heartbeat) clearInterval(heartbeat);
+  });
+
   const snapshot = (initial) => {
-    const data = safeReadLines(filePath, MAX_TAIL_BYTES);
-    if (!data) {
+    // 先 stat 比较 size/mtime/inode，未变化就不重新读文件（避免每 tick 全量读日志）
+    let st;
+    try {
+      st = fs.statSync(filePath);
+    } catch (e) {
       emit('error', { message: '日志文件不存在' });
       return;
     }
-    if (data.size < lastSize || data.mtimeMs < lastMtime) {
+    if (st.size === lastSize && st.mtimeMs === lastMtime && st.ino === lastIno && !initial) return;
+    // 日志轮转判定：inode 变化（新文件）或 size 变小或 mtime 回退
+    if ((lastIno !== -1 && st.ino !== lastIno) || st.size < lastSize || st.mtimeMs < lastMtime) {
       // 日志轮转 / 被截断：重新发送快照
-      lastSize = data.size;
-      lastMtime = data.mtimeMs;
+      lastSize = st.size;
+      lastMtime = st.mtimeMs;
+      lastIno = st.ino;
       emit('rotated', { message: '日志已轮转，重新加载' });
       const snapshotData = getLogLines(name, linesCount);
       emit('snapshot', snapshotData);
+      return;
+    }
+    const data = safeReadLines(filePath, MAX_TAIL_BYTES);
+    if (!data) {
+      emit('error', { message: '日志文件不存在' });
       return;
     }
     const n = Math.min(MAX_LOG_LINES, Math.max(10, linesCount));
@@ -1263,11 +1389,12 @@ function handleLogStream(req, res, name, linesCount) {
     if (initial) {
       lastSize = data.size;
       lastMtime = data.mtimeMs;
+      lastIno = st.ino;
       emit('snapshot', {
         name,
         size: data.size,
         mtime: data.mtimeMs,
-        totalLines: data.lines.length,
+        tailLines: data.lines.length,
         lines: rawLines.map((text, i) => ({
           index: data.lines.length - rawLines.length + i,
           level: name.startsWith('gpuowl') ? classifyGpuowlLine(text) : classifyApnLine(text),
@@ -1290,6 +1417,7 @@ function handleLogStream(req, res, name, linesCount) {
       const newText = buf.toString('utf8', 0, off);
       lastSize = data.size;
       lastMtime = data.mtimeMs;
+      lastIno = st.ino;
       const added = newText.split('\n').filter((l) => l.length > 0);
       if (added.length) {
         emit('lines', {
@@ -1301,9 +1429,11 @@ function handleLogStream(req, res, name, linesCount) {
       }
     } else {
       lastMtime = data.mtimeMs;
+      lastIno = st.ino;
     }
   };
 
+  // 首次初始化 lastIno（供轮转判定）
   snapshot(true);
   timer = setInterval(() => {
     try {
@@ -1313,7 +1443,17 @@ function handleLogStream(req, res, name, linesCount) {
     }
   }, 1500);
 
-  const heartbeat = setInterval(() => res.write(': ping\n\n'), 20000);
+  heartbeat = setInterval(() => {
+    if (isClosed()) {
+      clearInterval(heartbeat);
+      return;
+    }
+    try {
+      res.write(': ping\n\n');
+    } catch (e) {
+      clearInterval(heartbeat);
+    }
+  }, 20000);
   req.on('close', () => {
     clearInterval(timer);
     clearInterval(heartbeat);
@@ -1325,6 +1465,17 @@ const server = http.createServer(async (req, res) => {
   const pathname = url.pathname;
 
   try {
+    // 控制接口鉴权：设置 MONITOR_TOKEN 后，所有 POST /api/* 必须携带 x-auth-token
+    if (
+      AUTH_TOKEN &&
+      req.method === 'POST' &&
+      pathname.startsWith('/api/') &&
+      req.headers['x-auth-token'] !== AUTH_TOKEN
+    ) {
+      sendJson(res, 401, { ok: false, error: '未授权：缺少或错误的访问令牌（x-auth-token）' });
+      return;
+    }
+
     if (pathname === '/api/status') {
       sendJson(res, 200, buildStatus());
       return;
@@ -1448,6 +1599,12 @@ const server = http.createServer(async (req, res) => {
   } catch (e) {
     sendJson(res, 500, { error: String(e.message || e) });
   }
+});
+
+server.on('error', (e) => {
+  console.error('[monitor] 服务器错误:', e.message);
+  if (e.code === 'EADDRINUSE') console.error(`[monitor] 端口 ${PORT} 已被占用`);
+  process.exit(1);
 });
 
 server.listen(PORT, HOST, () => {

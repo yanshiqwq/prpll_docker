@@ -10,7 +10,7 @@ ENV NODE_ENV=production \
     PORT=8080 \
     DATA_DIR=/data
 
-COPY --chown=node:node package.json server.js db.js mersenne.js tasks.js ./
+COPY --chown=node:node package.json server.js db.js gpuowl-parse.js mersenne.js tasks.js ./
 COPY --chown=node:node public ./public
 COPY --chown=node:node vendor ./vendor
 

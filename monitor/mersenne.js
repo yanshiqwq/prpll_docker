@@ -16,6 +16,7 @@ const UA =
 const BASE = 'https://www.mersenne.org';
 const TIMEOUT_MS = 20000;
 const TTL_MS = 10 * 60 * 1000;
+const MAX_RETRIES = 2; // 网络错误 / 5xx 重试次数（4xx 不重试）
 
 let username = '';
 function setUsername(u) {
@@ -27,24 +28,49 @@ const cache = {
   fetchedAt: 0,
   lastError: null,
   inflight: null,
+  generation: 0, // 每次 clearCache 递增；in-flight 完成时若代际不匹配则丢弃结果
 };
 
 async function fetchText(url, opts = {}) {
-  const res = await fetch(url, {
-    method: opts.method || 'GET',
-    headers: {
-      'User-Agent': UA,
-      'Accept': '*/*',
-      ...(opts.headers || {}),
-    },
-    body: opts.body,
-    redirect: 'follow',
-    signal: AbortSignal.timeout(TIMEOUT_MS),
-  });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const buf = Buffer.from(await res.arrayBuffer());
-  // mersenne.org 页面为 latin-1 编码
-  return buf.toString('latin1');
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const attempt = async (retry) => {
+    let res;
+    try {
+      res = await fetch(url, {
+        method: opts.method || 'GET',
+        headers: {
+          'User-Agent': UA,
+          'Accept': '*/*',
+          ...(opts.headers || {}),
+        },
+        body: opts.body,
+        redirect: 'follow',
+        signal: AbortSignal.timeout(TIMEOUT_MS),
+      });
+    } catch (e) {
+      // 超时 / 网络中断：可重试（AbortError/TypeError 等）
+      if (retry > 0) {
+        await sleep(500 * (MAX_RETRIES - retry + 1));
+        return attempt(retry - 1);
+      }
+      throw e;
+    }
+    if (!res.ok) {
+      // 服务器 5xx 可重试；4xx（如 404）不重试
+      if (retry > 0 && res.status >= 500) {
+        await sleep(500 * (MAX_RETRIES - retry + 1));
+        return attempt(retry - 1);
+      }
+      throw new Error(`HTTP ${res.status}`);
+    }
+    const buf = Buffer.from(await res.arrayBuffer());
+    // 按响应头声明的编码解码；mersenne.org 未声明时默认 latin-1
+    const ct = res.headers.get('content-type') || '';
+    const charset = /charset=([\w-]+)/i.exec(ct);
+    if (charset && /^utf-?8$/i.test(charset[1])) return buf.toString('utf8');
+    return buf.toString('latin1');
+  };
+  return attempt(MAX_RETRIES);
 }
 
 /** 供其他模块使用的公共抓取（默认 latin-1 解码，适合 mersenne.org 页面/JSON） */
@@ -87,6 +113,13 @@ async function unreserveByAid(aid, guid) {
   try {
     const text = await fetchText(`https://v5.mersenne.org/v5server/?${params}`);
     const resp = parseV5(text);
+    if (resp.pnErrorResult == null) {
+      return {
+        ok: false,
+        error: 'PrimeNet 响应缺少 pnErrorResult 字段',
+        detail: (resp.pnErrorDetail || '').trim(),
+      };
+    }
     const rc = parseInt(resp.pnErrorResult, 10);
     const ok = rc === 0 || rc === 43; // 43 = 无效分配键（该分配已不存在，视为成功）
     return {
@@ -157,27 +190,34 @@ async function fetchAssignments(u) {
 /** 抓取历史 LL / PRP 结果（HTML 表格 -> 统一记录） */
 async function fetchResults(u) {
   const common = `user_id=${encodeURIComponent(u)}&ver=1&unv=1&bad=1&fac=1`;
-  const [llHtml, prpHtml] = await Promise.all([
+  const [llRes, prpRes] = await Promise.allSettled([
     fetchText(`${BASE}/report_ll/?${common}`),
     fetchText(`${BASE}/report_prp/?${common}`),
   ]);
 
-  const llRows = parseTable(llHtml, [
+  const llRows = llRes.status === 'fulfilled' ? parseTable(llRes.value, [
     'Exponent', 'User name', 'Computer name', 'Residue', 'Software', 'Date found',
-  ]);
-  const prpRows = parseTable(prpHtml, [
+  ]) : [];
+  const prpRows = prpRes.status === 'fulfilled' ? parseTable(prpRes.value, [
     'Exponent', 'User name', 'Computer name', 'Residue', 'Software', 'Date found',
-  ]);
+  ]) : [];
+  // 两个页面都失败时抛出（触发上层 stale 降级）；单边失败则返回可用部分
+  if (!llRows.length && !prpRows.length) {
+    const err = llRes.status === 'rejected' ? llRes.reason : prpRes.reason;
+    throw err;
+  }
 
   const toRecord = (row, type) => {
     const dateCell = row.datefound || '';
     const date = /^\d{4}-\d{2}-\d{2}/.exec(dateCell)?.[0] || null;
-    // 生成可排序时间戳：带完整时间用其时间，仅有日期按当天 00:00:00 处理，
-    // 避免无时间戳记录在排序时被排到最后导致"最近完成"取到旧记录
+    // 生成可排序时间戳：带完整时间用其时间，仅有日期按当天 00:00:00 处理（仅用于排序），
+    // 并标记 dateOnly 供前端显示 --:--:-- 占位，避免展示成默认的 00:00 UTC 换算时间
     let dateTs = null;
+    let dateOnly = false;
     const dt = /^(\d{4}-\d{2}-\d{2})(?: (\d{2}):(\d{2}):(\d{2}))?$/.exec(dateCell);
     if (dt) {
       const [, d, hh = '00', mm = '00', ss = '00'] = dt;
+      dateOnly = dt[2] == null;
       dateTs = new Date(`${d}T${hh}:${mm}:${ss}Z`).toISOString();
     }
     return {
@@ -189,6 +229,7 @@ async function fetchResults(u) {
       software: row.software || null,
       date,
       dateTs,
+      dateOnly,
     };
   };
 
@@ -238,16 +279,21 @@ async function getMersenne(force = false) {
   }
   if (cache.inflight) return cache.inflight;
 
+  const gen = cache.generation;
   cache.inflight = (async () => {
     try {
       const data = await fetchAll(username);
+      // clearCache 之后完成的旧请求不应回填缓存（避免显示已取消/旧分配）
+      if (gen !== cache.generation) {
+        return { ok: false, error: '数据已失效，已忽略过期抓取结果', stale: true, fetchedAt: null };
+      }
       cache.data = data;
       cache.fetchedAt = Date.now();
       cache.lastError = null;
       return { ok: true, ...data, cached: false, fetchedAt: cache.fetchedAt };
     } catch (e) {
       cache.lastError = String(e.message || e);
-      if (cache.data) {
+      if (cache.data && gen === cache.generation) {
         return {
           ok: false,
           error: cache.lastError,
@@ -264,16 +310,13 @@ async function getMersenne(force = false) {
   return cache.inflight;
 }
 
-function getLastError() {
-  return cache.lastError;
-}
-
 /** 清除抓取缓存（取消/导入分配后调用，让下次读取立即反映最新状态） */
 function clearCache() {
   cache.data = null;
   cache.fetchedAt = 0;
   cache.lastError = null;
   cache.inflight = null;
+  cache.generation++;
 }
 
-module.exports = { setUsername, getMersenne, getLastError, unreserveByAid, fetchPublicText, clearCache };
+module.exports = { setUsername, getMersenne, unreserveByAid, fetchPublicText, clearCache };

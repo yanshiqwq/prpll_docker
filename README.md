@@ -57,6 +57,17 @@ docker compose logs -f
 
 前两个服务共享同一个 `data/` 目录：AutoPrimeNet 负责写入 `worktodo.txt` 并从 `results.txt` 读取结果，PRPLL 负责实际计算
 
+## 监控面板安全（可选）
+
+面板的队列管理接口（暂停 / 恢复 / 取消 / 添加 / 导入）默认不设访问控制，若部署在可被局域网其他设备访问的主机上，建议设置访问令牌：
+
+```bash
+export MONITOR_TOKEN=换成你的随机令牌
+docker compose up -d monitor
+```
+
+设置后所有 `POST /api/*` 请求都必须携带 `x-auth-token` 请求头，否则返回 401。
+
 ## 数据目录
 
 `data/` 首次启动时自动创建，主要文件：

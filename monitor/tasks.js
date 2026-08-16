@@ -103,10 +103,21 @@ function readLogTail(filePath, maxBytes = 8192) {
 async function waitForPrpllStop(timeoutMs = 90000) {
   const start = Date.now();
   let sawStopping = false;
+  const logFiles = () => {
+    try {
+      return fs
+        .readdirSync(dataPath(''))
+        .filter((f) => /^gpuowl-\d+\.log$/.test(f))
+        .map((f) => dataPath(f));
+    } catch (e) {
+      return [dataPath('gpuowl-0.log')];
+    }
+  };
   while (Date.now() - start < timeoutMs) {
-    const tail = readLogTail(dataPath('gpuowl-0.log'));
-    if (/Stopping, please wait/.test(tail)) sawStopping = true;
-    if (sawStopping && /Bye\b/.test(tail)) {
+    let tailAll = '';
+    for (const fp of logFiles()) tailAll += readLogTail(fp);
+    if (/Stopping, please wait/.test(tailAll)) sawStopping = true;
+    if (sawStopping && /Bye\b/.test(tailAll)) {
       return { ok: true, note: 'PRPLL 已保存检查点并退出，Docker 将自动重启' };
     }
     await sleep(2000);
@@ -159,6 +170,11 @@ function readState() {
 
 function writeState(state) {
   fs.writeFileSync(dataPath(STATE_FILE), JSON.stringify(state, null, 2));
+}
+
+/** 状态文件读写加锁，避免并发暂停/恢复互相覆盖 */
+function withStateLock(fn) {
+  return withLock(dataPath(STATE_FILE), fn);
 }
 
 // ---------------------------------------------------------------- 任务行解析
@@ -269,24 +285,29 @@ async function pauseTask(exponent, immediate = false) {
   const task = findTask(exponent);
   if (!task) return { ok: false, error: `队列中未找到指数 ${exponent}` };
 
-  const state = readState();
-  if (state.paused.some((p) => p.exponent === exponent)) {
-    return { ok: false, error: `指数 ${exponent} 已在暂停列表中` };
+  try {
+    await withLock(dataPath(task.file), () =>
+      withStateLock(() => {
+        const state = readState();
+        if (state.paused.some((p) => p.exponent === exponent)) {
+          throw new Error(`指数 ${exponent} 已在暂停列表中`);
+        }
+        const removed = removeLineFromFile(task.file, exponent);
+        if (removed) {
+          state.paused.push({
+            line: removed,
+            file: task.file,
+            exponent,
+            type: parseLine(removed)?.type || '?',
+            pausedAt: new Date().toISOString(),
+          });
+          writeState(state);
+        }
+      })
+    );
+  } catch (e) {
+    return { ok: false, error: String(e.message || e) };
   }
-
-  await withLock(dataPath(task.file), () => {
-    const removed = removeLineFromFile(task.file, exponent);
-    if (removed) {
-      state.paused.push({
-        line: removed,
-        file: task.file,
-        exponent,
-        type: parseLine(removed)?.type || '?',
-        pausedAt: new Date().toISOString(),
-      });
-      writeState(state);
-    }
-  });
   let prpll = null;
   if (immediate) {
     try {
@@ -301,44 +322,71 @@ async function pauseTask(exponent, immediate = false) {
 }
 
 async function resumeTask(exponent) {
-  const state = readState();
-  const idx = state.paused.findIndex((p) => p.exponent === exponent);
-  if (idx < 0) return { ok: false, error: `指数 ${exponent} 不在暂停列表中` };
-  const item = state.paused[idx];
+  const item = readState().paused.find((p) => p.exponent === exponent);
+  if (!item) return { ok: false, error: `指数 ${exponent} 不在暂停列表中` };
 
-  await withLock(dataPath(item.file), () => {
-    appendLineToFile(item.file, item.line);
-  });
-  state.paused.splice(idx, 1);
-  writeState(state);
+  try {
+    await withLock(dataPath(item.file), () =>
+      withStateLock(() => {
+        const state = readState();
+        const idx = state.paused.findIndex((p) => p.exponent === exponent);
+        if (idx < 0) throw new Error(`指数 ${exponent} 不在暂停列表中`);
+        appendLineToFile(item.file, state.paused[idx].line);
+        state.paused.splice(idx, 1);
+        writeState(state);
+      })
+    );
+  } catch (e) {
+    return { ok: false, error: String(e.message || e) };
+  }
   return { ok: true, exponent, action: 'resumed' };
 }
 
 async function cancelTask(exponent, unreserve = false, immediate = false) {
   const state = readState();
   const pausedIdx = state.paused.findIndex((p) => p.exponent === exponent);
-  let line = null;
-  let file = null;
-
   const task = findTask(exponent);
-  if (task) {
-    file = task.file;
-    line = task.line;
-    await withLock(dataPath(file), () => {
-      removeLineFromFile(file, exponent);
-    });
-  }
-  if (pausedIdx >= 0) {
-    line = line || state.paused[pausedIdx].line;
-    file = file || state.paused[pausedIdx].file;
-    state.paused.splice(pausedIdx, 1);
-    writeState(state);
-  }
+  const line = (task && task.line) || (pausedIdx >= 0 ? state.paused[pausedIdx].line : null);
+  const file = (task && task.file) || (pausedIdx >= 0 ? state.paused[pausedIdx].file : null);
   if (!line) return { ok: false, error: `队列与暂停列表中都未找到指数 ${exponent}` };
 
   const parsed = parseLine(line);
-  // 立即生效：先发 SIGINT（PRPLL 保存检查点退出，Docker 自动重启），
-  // 再处理 PrimeNet 网络请求，最后等待停止确认
+
+  // 先取消 PrimeNet 分配，成功后才删除本地任务行，避免留下"僵尸分配"
+  let primeNet = null;
+  if (unreserve) {
+    primeNet = await mersenne.unreserveByAid(parsed.aid, getComputerGuid());
+    // 取消成功后清掉 PrimeNet 抓取缓存，避免面板继续显示旧分配
+    if (primeNet && primeNet.ok) mersenne.clearCache();
+    if (primeNet && !primeNet.ok) {
+      return {
+        ok: false,
+        exponent,
+        action: 'cancelled',
+        primeNet,
+        error: primeNet.error || primeNet.message || 'PrimeNet 取消失败，本地任务未删除',
+      };
+    }
+  }
+
+  // 本地删除（队列行 + 暂停列表项），全程持锁
+  try {
+    await withLock(dataPath(file), () =>
+      withStateLock(() => {
+        if (task) removeLineFromFile(file, exponent);
+        const st = readState();
+        const idx = st.paused.findIndex((p) => p.exponent === exponent);
+        if (idx >= 0) {
+          st.paused.splice(idx, 1);
+          writeState(st);
+        }
+      })
+    );
+  } catch (e) {
+    return { ok: false, exponent, action: 'cancelled', primeNet, error: String(e.message || e) };
+  }
+
+  // 立即生效：发 SIGINT（PRPLL 保存检查点退出，Docker 自动重启），等待停止确认
   let prpll = null;
   if (immediate) {
     try {
@@ -347,12 +395,6 @@ async function cancelTask(exponent, unreserve = false, immediate = false) {
     } catch (e) {
       prpll = { ok: false, error: String(e.message || e) };
     }
-  }
-  let primeNet = null;
-  if (unreserve) {
-    primeNet = await mersenne.unreserveByAid(parsed.aid, getComputerGuid());
-    // 取消成功后清掉 PrimeNet 抓取缓存，避免面板继续显示旧分配
-    if (primeNet && primeNet.ok) mersenne.clearCache();
   }
   if (prpll) {
     if (prpll.ok) {
@@ -392,10 +434,20 @@ async function addTasks(rawLines) {
   }
 
   if (valid.length) {
-    const target = valid.some((l) => parseLine(l)?.type === 'CERT') ? 'certwork-0.txt' : 'worktodo-0.txt';
-    await withLock(dataPath(target), () => {
-      appendLineToFile(target, valid.join('\n'));
-    });
+    // 按类型拆分：CERT 写 certwork-0.txt，其余（PRP/PRPDC/LL 等）写 worktodo-0.txt，
+    // 避免混写导致 AutoPrimeNet 误解析
+    const certLines = valid.filter((l) => parseLine(l)?.type === 'CERT');
+    const workLines = valid.filter((l) => parseLine(l)?.type !== 'CERT');
+    if (workLines.length) {
+      await withLock(dataPath('worktodo-0.txt'), () => {
+        appendLineToFile('worktodo-0.txt', workLines.join('\n'));
+      });
+    }
+    if (certLines.length) {
+      await withLock(dataPath('certwork-0.txt'), () => {
+        appendLineToFile('certwork-0.txt', certLines.join('\n'));
+      });
+    }
   }
   return { ok: true, added: valid, invalid };
 }
@@ -441,6 +493,20 @@ async function fetchFactoredBits(exponent) {
   return r && r.no_factor_to_bits != null ? r.no_factor_to_bits : null;
 }
 
+/** 并发执行异步任务（限制并发数） */
+async function mapWithConcurrency(items, limit, fn) {
+  const out = new Array(items.length);
+  let i = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (i < items.length) {
+      const idx = i++;
+      out[idx] = await fn(items[idx], idx);
+    }
+  });
+  await Promise.all(workers);
+  return out;
+}
+
 /** 获取 PrimeNet 上可导入（本地队列中不存在）的任务候选，不写入文件 */
 async function getImportCandidates() {
   const username = getIniValue('username') || getIniValue('user_name');
@@ -462,20 +528,22 @@ async function getImportCandidates() {
   const typeMap = { PRP: 'PRP', 'PRP-D': 'PRPDC' };
   const candidates = [];
 
-  for (const a of assignments) {
+  const eligible = assignments.filter((a) => {
     const exp = a.exponent;
-    if (!exp || existing.has(exp)) continue;
+    return exp && !existing.has(exp) && typeMap[a.work_type] && aidMap.get(exp);
+  });
+  // 试除位数逐个抓取较慢，限制并发数为 4
+  await mapWithConcurrency(eligible, 4, async (a) => {
+    const exp = a.exponent;
     const type = typeMap[a.work_type];
-    if (!type) continue;
     const aid = aidMap.get(exp);
-    if (!aid) continue;
-    let bits = 0;
+    let bits = null;
     try {
       bits = await fetchFactoredBits(exp);
     } catch (e) {
-      continue;
+      return;
     }
-    if (bits == null) continue;
+    if (bits == null) return;
     candidates.push({
       exponent: exp,
       type,
@@ -483,7 +551,7 @@ async function getImportCandidates() {
       bits,
       line: `${type}=${aid},1,2,${exp},-1,${bits},0`,
     });
-  }
+  });
   candidates.sort((a, b) => a.exponent - b.exponent);
   return { ok: true, candidates, totalAssignments: assignments.length };
 }
